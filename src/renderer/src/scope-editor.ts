@@ -1,7 +1,8 @@
 import type { KNode, Pack, ScopeSpec } from '../../shared/types'
 import { primaryBranch } from '../../main/domain/learning'
-import { legacyScope, relationships, scopedPack, scopeItems, validateGraph, validateScope } from '../../main/domain/scope'
+import { archiveNode, legacyScope, relationships, scopedPack, scopeItems, validateGraph, validateScope } from '../../main/domain/scope'
 import { draftScope, endpointStatus, generatePack } from './ai'
+import { helpTip } from './help-tip'
 
 type Options = {
   pack?: Pack
@@ -65,6 +66,8 @@ export function openScopeEditor(box: HTMLElement, options: Options): void {
   function fromCurrent(): Pack {
     const pack = existing!
     const previousScope = legacyScope(pack)
+    const subject = scope.subject || pack.subject
+    const topic = scope.topic || previousScope.topic
     const valid = new Set([...scope.include, ...scope.foundations].map((item) => item.id))
     const nodes = pack.nodes.map((node) => {
       const branch = primaryBranch(node.id, pack.nodes)
@@ -72,8 +75,8 @@ export function openScopeEditor(box: HTMLElement, options: Options): void {
       const scopeIds = (node.scopeIds ?? (inherited ? [inherited] : [])).filter((id) => valid.has(id))
       return { ...node, scopeIds }
     })
-    return { ...pack, scope: { ...scope, source: 'confirmed' }, subject: scope.subject,
-      title: scope.topic, meta: { exam: '', subject: scope.subject, chapter: scope.topic }, nodes }
+    return { ...pack, scope: { ...scope, subject, topic, source: 'confirmed' }, subject,
+      title: topic, meta: { exam: pack.meta?.exam ?? '', subject, chapter: topic }, nodes }
   }
 
   async function run(action: () => Promise<void>) {
@@ -117,8 +120,10 @@ export function openScopeEditor(box: HTMLElement, options: Options): void {
   function render() {
     const ai = endpointStatus()
     const status = !ai.reachable ? 'AI 代理离线，内置板块与手动编辑仍可使用。'
-      : !ai.supportsScope ? '当前 AI 代理版本过旧，请重启新版服务。' : '实时生成只发送当前描述、范围和必要结构。'
-    const items = [...scope.include, ...scope.foundations]
+      : !ai.supportsOptionalScope ? 'AI 代理版本过旧，请关闭旧启动窗口并重新运行 start.bat。'
+        : 'AI 代理' + (ai.proxyVersion ? ' v' + ai.proxyVersion : '') + ' 已连接。实时生成只发送当前描述、范围和必要结构。'
+    const shownScope = candidate?.scope ?? scope
+    const items = [...shownScope.include, ...shownScope.foundations]
     const originals = new Map(existing?.nodes.map((n) => [n.id, n]))
     const active = new Set(candidate?.nodes.map((n) => n.id))
     const archived = existing?.nodes.filter((n) => !active.has(n.id)) ?? []
@@ -129,23 +134,34 @@ export function openScopeEditor(box: HTMLElement, options: Options): void {
     }
     const needsConsent = generated && (archived.some((n) => n.edited || n.weightLocked) || candidate?.nodes.some(protectedChange))
     const disabled = busy ? 'disabled' : ''
-    const textarea = (id: string, label: string, v: string) =>
-      '<label>' + label + '<textarea class="sinput" id="' + id + '" rows="2">' + esc(v) + '</textarea></label>'
+    const textarea = (id: string, label: string, v: string, options?: { required?: boolean; help?: string }) => {
+      const help = options?.help ? helpTip(label + '用法', options.help) : ''
+      return '<div class="scope-textfield"><div class="scope-field-head"><label for="' + id + '">' + esc(label) + '</label>' + help +
+        '</div><textarea class="sinput" id="' + id + '" rows="2"' + (options?.required ? ' required' : '') + '>' + esc(v) + '</textarea></div>'
+    }
     const selector = (name: string, options: { id: string; label: string }[], selected: string[], multi = false) =>
       '<select name="' + name + '" ' + (multi ? 'multiple size="3"' : '') + '>' + options.map((o) =>
         '<option value="' + esc(o.id) + '" ' + (selected.includes(o.id) ? 'selected' : '') + '>' + esc(o.label) + '</option>').join('') + '</select>'
     const draftForm =
-      textarea('scope-request', existing ? '描述你要怎样调整范围和知识网' : '用一句话说说你想学什么', request) +
-      (question ? textarea('scope-answer', esc(question), answer) : '') +
-      '<div class="scope-actions"><button id="scope-draft" ' + disabled + '>拟定范围草案</button>' +
+      textarea('scope-request', existing ? '描述你要怎样调整范围和知识网（选填）' : '用一句话说明想学的内容（必填）', request, { required: !existing }) +
+      (question ? textarea('scope-answer', question, answer) : '') +
+      '<p class="gsub">' + (existing ? '可直接生成新预览，也可以手动调整已有知识网。' : '填完一句话就能生成，下面的范围可以留空，之后也可调整。') + '</p>' +
+      '<div class="scope-actions"><button class="primary" id="scope-generate" ' + disabled + '>确认并生成</button>' +
+      '<button id="scope-draft" ' + disabled + '>拟定范围草案</button>' +
       (options.builtin ? '<button id="scope-builtin">打开内置板块</button>' : '') + '</div>' +
+      '<div class="col-title">学习范围（选填）</div>' +
       '<div class="scope-fields">' + details.map((key, i) =>
         '<label>' + detailLabels[i] + '<input class="sinput" id="scope-' + key + '" value="' + esc(scope[key]) + '"></label>').join('') +
-      textarea('scope-include', '纳入项（每行一项）', scope.include.map((item) => item.label).join('\n')) +
-      textarea('scope-exclude', '排除项（每行一项）', scope.exclude.join('\n')) +
-      textarea('scope-foundations', '必要前置（每行一项）', scope.foundations.map((item) => item.label).join('\n')) + '</div>' +
-      '<div class="scope-actions">' + (existing ? '<button id="scope-manual" ' + disabled + '>手动调整知识网</button>' : '') +
-      '<button class="primary" id="scope-generate" ' + disabled + '>确认并生成</button></div>'
+      textarea('scope-include', '纳入项', scope.include.map((item) => item.label).join('\n'), {
+        help: '写下这次一定想学的内容，每行一项。例如「一次函数图像」「斜率」。留空时由 AI 根据描述选择。'
+      }) +
+      textarea('scope-exclude', '排除项', scope.exclude.join('\n'), {
+        help: '写下这次想跳过的内容，每行一项。例如只学一次函数时，可以写「二次函数」。留空即可。'
+      }) +
+      textarea('scope-foundations', '必要前置', scope.foundations.map((item) => item.label).join('\n'), {
+        help: '写下希望先复习的基础，每行一项。例如学一次函数前先复习「平面直角坐标系」。'
+      }) + '</div>' +
+      (existing ? '<div class="scope-actions"><button id="scope-manual" ' + disabled + '>手动调整知识网</button></div>' : '')
     const graphForm = candidate && !preview ? candidate.nodes.map((node) => {
       const other = candidate!.nodes.filter((n) => n.id !== node.id).map((n) => ({ id: n.id, label: n.name }))
       return '<div class="card" data-edit-node="' + esc(node.id) + '"><label>名称 <input name="name" class="sinput" value="' + esc(node.name) + '"></label>' +
@@ -159,10 +175,10 @@ export function openScopeEditor(box: HTMLElement, options: Options): void {
           '> 补充基础</label><div class="scope-actions"><button data-archive="' + esc(node.id) + '">归档</button>' +
           (originals.has(node.id) ? '<button data-reidentify="' + esc(node.id) + '">含义变化，使用新 ID</button>' : '') + '</div>') + '</div>'
     }).join('') + '<div class="scope-actions"><button id="scope-add">新增考点</button><button class="primary" id="scope-preview">检查并预览差异</button></div>' : ''
-    const diff = candidate && preview ? '<p>' + esc(scope.stage + ' · ' + scope.subject + ' · ' + scope.topic + ' · ' + scope.goal + ' · ' + scope.depth) +
-      '</p><p>纳入 ' + esc(scope.include.map((i) => i.label).join('、')) + '　排除 ' + esc(scope.exclude.join('、') || '无') +
-      '　必要前置 ' + esc(scope.foundations.map((i) => i.label).join('、') || '无') + '</p>' +
-      (existing ? '<p>原范围 ' + esc(legacyScope(existing).include.map((i) => i.label).join('、')) + ' · ' + esc(legacyScope(existing).goal) + '</p>' : '') +
+    const diff = candidate && preview ? '<p>' + esc(details.map((key) => shownScope[key]).filter(Boolean).join(' · ')) +
+      '</p><p>纳入 ' + esc(shownScope.include.map((i) => i.label).join('、') || '按学习描述确定') + '　排除 ' + esc(shownScope.exclude.join('、') || '未指定') +
+      '　必要前置 ' + esc(shownScope.foundations.map((i) => i.label).join('、') || '未指定') + '</p>' +
+      (existing ? '<p>原范围 ' + esc(legacyScope(existing).include.map((i) => i.label).join('、') || '未指定纳入项') + '</p>' : '') +
       '<ol>' + candidate.nodes.map((node) => {
         const old = originals.get(node.id)
         const parent = candidate!.nodes.find((n) => n.id === node.parentId)
@@ -190,7 +206,7 @@ export function openScopeEditor(box: HTMLElement, options: Options): void {
       syncScope()
       void run(async () => {
         if (!request) throw new Error('请先描述学习目标。')
-        const reply = await draftScope(request + (question && answer ? '\n' + question + '\n' + answer : ''), existing ? scope : undefined)
+        const reply = await draftScope(request + (question && answer ? '\n' + question + '\n' + answer : ''), scope)
         if (!live()) return
         for (const key of details) if (typeof reply[key] === 'string' && reply[key]?.trim()) scope[key] = reply[key]!
         if (Array.isArray(reply.include)) scope.include = scopeItems(list(reply.include).join('\n'), scope.include, () => uid('i'))
@@ -204,12 +220,19 @@ export function openScopeEditor(box: HTMLElement, options: Options): void {
     bind('scope-generate', () => {
       syncScope()
       void run(async () => {
-        validateScope(scope)
-        const confirmed: ScopeSpec = { ...scope, source: 'confirmed', version: scope.version + 1 }
-        const raw = await generatePack({ scope: confirmed, request, current: existing?.nodes })
+        if (!existing && !request) throw new Error('请先用一句话说明想学的内容。')
+        const description = request + (question && answer ? '\n' + question + '\n' + answer : '')
+        const topic = scope.topic || (!request && existing ? legacyScope(existing).topic : '')
+        const raw = await generatePack({ scope: { ...scope, topic }, request: description, current: existing?.nodes })
         if (!live()) return
+        const confirmed: ScopeSpec = {
+          ...scope, source: 'confirmed', version: scope.version + 1,
+          subject: scope.subject || raw.subject || existing?.subject || '',
+          topic: topic || raw.chapter || request.slice(0, 60)
+        }
         const next = scopedPack(confirmed, raw.nodes, existing?.packId ?? uid('ai'))
         if (existing) {
+          if (next.meta && existing.meta) next.meta.exam = existing.meta.exam
           const ids = new Map(next.nodes.filter((node) => !originals.has(node.id)).map((node) => [node.id, uid('n')]))
           next.nodes = remap(next.nodes, ids).map((node) => {
             const old = originals.get(node.id)
@@ -227,8 +250,9 @@ export function openScopeEditor(box: HTMLElement, options: Options): void {
     bind('scope-manual', () => {
       syncScope()
       void run(async () => {
-        validateScope(scope)
-        candidate = fromCurrent()
+        const next = fromCurrent()
+        validateScope(next.scope!)
+        candidate = next
         generated = false
         preview = false
       })
@@ -247,13 +271,11 @@ export function openScopeEditor(box: HTMLElement, options: Options): void {
       const id = button.dataset.archive ?? button.dataset.reidentify
       const node = candidate?.nodes.find((n) => n.id === id)
       if (!candidate || !node) return
-      if (button.dataset.archive) {
-        candidate.nodes = candidate.nodes.filter((n) => n !== node).map((n) => ({
-          ...n, parentId: n.parentId === node.id ? node.parentId : n.parentId,
-          prereq: n.prereq.filter((p) => p !== node.id), confusable: n.confusable.filter((p) => p !== node.id)
-        }))
-      } else candidate.nodes = remap(candidate.nodes, new Map([[node.id, uid('u')]]))
-      candidate.relations = relationships(candidate.nodes, candidate.relations)
+      if (button.dataset.archive) candidate = archiveNode(candidate, node.id)
+      else {
+        candidate.nodes = remap(candidate.nodes, new Map([[node.id, uid('u')]]))
+        candidate.relations = relationships(candidate.nodes, candidate.relations)
+      }
       render()
     }))
     bind('scope-preview', () => {

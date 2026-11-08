@@ -123,15 +123,15 @@ function verifyPromptFor(q) {
     return `题目：${q.stem}${opt}
 
 先把 A/B/C/D **逐个**说明它对在哪或错在哪，再给出正确选项。
-answer 写正确选项的**内容原文**（不要只写字母）。
+answer 只写正确选项的字母 A、B、C 或 D。
 
-输出：{"steps":"逐项判断","answer":"正确选项内容","ambiguous":false}`
+输出：{"steps":"逐项判断","answer":"B","ambiguous":false}`
   }
 
   return `题目：${q.stem}
 
 先写出关键中间步骤（每一步算出什么），再给最终答案。
-答案要比对时能对上，写最简形式即可。
+答案用学生可直接输入的最简纯文本，如 3/2、sqrt(2)、H2O。
 
 输出：{"steps":"中间步骤","answer":"最终答案","ambiguous":false}`
 }

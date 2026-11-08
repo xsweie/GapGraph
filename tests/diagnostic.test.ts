@@ -5,6 +5,7 @@ import {
   DIAG_TARGET,
   applyDiagAnswer,
   createDiagnostic,
+  diagnosticTargets,
   nextQuestion,
   primaryNodeOf,
   summarize
@@ -105,6 +106,12 @@ describe('摸底选题', () => {
     for (const q of questions) s = applyDiagAnswer(s, q.id, primaryNodeOf(q)!, true)
     expect(nextQuestion(s, questions, nodes, mastery)).toBeNull()
   })
+
+  it('主分支已经测过时，缺题优先准备新子节点的题目', () => {
+    const child = { ...mkNode('new-child', 0.5), parentId: 'basic' }
+    const state = applyDiagAnswer(createDiagnostic(), 'q_b1', 'basic', true)
+    expect(diagnosticTargets(state, questions, [root, nodes[1], child]).map((node) => node.id)).toEqual(['new-child'])
+  })
 })
 
 describe('摸底结果', () => {
@@ -125,5 +132,13 @@ describe('摸底结果', () => {
     expect(r.weakest[0].id).toBe('b')
     expect(r.weakest.length).toBeLessThanOrEqual(3)
     expect(r.bands.red + r.bands.orange + r.bands.yellow + r.bands.green).toBe(3)
+  })
+
+  it('已归档的考点保留提交次数，但不进入当前诊断建议', () => {
+    const s = applyDiagAnswer(applyDiagAnswer(createDiagnostic(), 'q1', 'a', true), 'q2', 'b', false)
+    const r = summarize(s, nodes.filter((node) => node.id !== 'b'), mastery, NOW)
+    expect(r.answered).toBe(2)
+    expect(r.touched).toBe(1)
+    expect(r.weakest.map((node) => node.id)).toEqual(['a'])
   })
 })

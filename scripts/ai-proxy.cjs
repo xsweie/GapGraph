@@ -15,15 +15,17 @@ const fs = require('node:fs')
 const path = require('node:path')
 const { loadKey } = require('./deepseek-key.cjs')
 const { qcProblems, verifyPromptFor } = require('./question-qc.cjs')
+const { version } = require('../package.json')
 
 const PORT = Number(process.env.AI_PROXY_PORT || 3300)
 const HOST = '127.0.0.1'
 const UPSTREAM = 'https://api.deepseek.com/chat/completions'
-const MODEL = 'deepseek-chat'
+const MODEL = 'deepseek-flash'
+const FORMULA_FORMAT = '数学公式行内用 $...$，单独一行用 $$...$$。化学式和反应使用 $\\ce{2H2 + O2 -> 2H2O}$ 这样的格式。JSON 字符串内的反斜杠按 JSON 规则转义。'
 
 function scopeContext(scope) {
   if (!scope || typeof scope !== 'object') return ''
-  return '\n当前已确认学习范围：' + JSON.stringify({
+  return '\n学习范围与偏好：' + JSON.stringify({
     stage: scope.stage, subject: scope.subject, topic: scope.topic, goal: scope.goal,
     depth: scope.depth, include: scope.include, exclude: scope.exclude, foundations: scope.foundations
   }).slice(0, 5000)
@@ -66,8 +68,9 @@ function qaSystem(exam, subject) {
 - 如果学生在问某道具体的题，就着那道题的题干和选项讲，不要换成别的例子
 - 学生答错了，先指出他的误解出在哪一步，再给正确思路
 - 讲不超过 180 字，能一句话说清就别写三句
+- ${FORMULA_FORMAT}
 输出格式：{"answer":"讲解正文","cards":[{"type":"conclusion|method|pitfall|formula","front":"正面问题","back":"背面答案"}]}
-cards 最多 2 张，没必要时给空数组。`
+cards 最多 2 张，每张正面不超过 60 字、背面不超过 90 字，没必要时给空数组。`
 }
 
 /**
@@ -81,7 +84,7 @@ async function upstream(body, timeoutMs = 25000) {
   const res = await fetch(UPSTREAM, {
     method: 'POST',
     headers: { 'content-type': 'application/json', authorization: `Bearer ${KEY}` },
-    body: JSON.stringify(body),
+    body: JSON.stringify({ ...body, model: MODEL, thinking: { type: 'disabled' } }),
     signal: AbortSignal.timeout(timeoutMs)
   })
   const text = await res.text()
@@ -148,7 +151,10 @@ const server = http.createServer(async (req, res) => {
   }
 
   if (req.method === 'GET' && req.url === '/health') {
-    json(res, 200, { ok: true, model: MODEL, routes: ['scope', 'chat', 'pack', 'questions', 'explain'], pid: process.pid })
+    json(res, 200, {
+      ok: true, version, model: MODEL, routes: ['scope', 'chat', 'pack', 'questions', 'explain'],
+      capabilities: ['optional-scope', 'full-question-text'], pid: process.pid
+    })
     return
   }
 
@@ -174,7 +180,10 @@ const server = http.createServer(async (req, res) => {
       '.css': 'text/css; charset=utf-8',
       '.json': 'application/json; charset=utf-8',
       '.svg': 'image/svg+xml',
-      '.png': 'image/png'
+      '.png': 'image/png',
+      '.woff2': 'font/woff2',
+      '.woff': 'font/woff',
+      '.ttf': 'font/ttf'
     }
     res.writeHead(200, { 'content-type': MIME[path.extname(file)] || 'application/octet-stream' })
     fs.createReadStream(file).pipe(res)
@@ -192,7 +201,7 @@ const server = http.createServer(async (req, res) => {
       const request = String(body.request || '').trim().slice(0, 1600)
       if (!request) return json(res, 400, { error: '请描述学习目标或范围调整。' })
       const data = await upstreamRetry({
-        model: MODEL, temperature: 0.25, response_format: { type: 'json_object' },
+        temperature: 0.25, response_format: { type: 'json_object' },
         messages: [
           { role: 'system', content: '根据学生已经提供的信息拟定可编辑的学习范围，不重复询问已给出的信息。应考复习与章节补齐都是目标。存在影响范围的关键歧义时，只问一个问题。其余字段能推断则填写，否则留空。仅输出 JSON：{"stage":"学段","subject":"学科","topic":"主题","goal":"目标","depth":"深度","include":["纳入项"],"exclude":["排除项"],"foundations":["必要前置"],"question":"唯一追问或空字符串"}。若已有范围，保留用户未要求修改的部分，适用新描述。' },
           { role: 'user', content: request + scopeContext(body.scope) }
@@ -209,26 +218,28 @@ const server = http.createServer(async (req, res) => {
   if (req.url === '/pack') {
     try {
       const body = await readBody(req)
-      const scope = body.scope
-      const exam = String(scope?.stage || body.exam || '').slice(0, 40)
-      const subject = String(scope?.subject || body.subject || '').slice(0, 40)
-      const chapter = String(scope?.topic || body.chapter || '').slice(0, 60)
-      if (!exam || !subject || !chapter || (scope && (!scope.goal || !scope.depth || !scope.include?.length))) {
-        json(res, 400, { error: '缺少已确认的学习范围。' })
-        return
+      const request = typeof body.request === 'string' ? body.request.trim().slice(0, 1600) : ''
+      if (body.scope != null && (typeof body.scope !== 'object' || Array.isArray(body.scope))) {
+        return json(res, 400, { error: '学习范围格式无效。' })
+      }
+      const scope = body.scope ?? (request ? {} : null)
+      const exam = String(scope?.stage || body.exam || '').trim().slice(0, 40)
+      const subject = String(scope?.subject || body.subject || '').trim().slice(0, 40)
+      const chapter = String(scope?.topic || body.chapter || '').trim().slice(0, 60)
+      if (scope ? !request && !chapter : !exam || !subject || !chapter) {
+        return json(res, 400, { error: '请用一句话说明想学的内容。' })
       }
 
       const t0 = Date.now()
       const data = await upstreamRetry(
         {
-          model: MODEL,
           temperature: 0.4,
           response_format: { type: 'json_object' },
           messages: [
             {
               role: 'system',
-              content: scope ? `你是学科教研员。只按已确认范围、学段、目标与深度生成知识网。节点数随主题粒度，可只有一个考点和根。不要引入排除项。仅输出 JSON：{"nodes":[{"id":"n1","name":"考点","kind":"root|concept|skill","parentId":null,"prereq":[],"confusable":[],"scopeIds":[],"supplementary":false,"examWeight":0.5,"brief":"讲解"}]}。
-根唯一且没有父级。其余节点有有效父级。每项纳入项和必要前置都须被关联，使用输入中的条目 ID。补充基础确有必要才加，标 supplementary=true。prereq 只填必学的前置 ID。父级和前置禁止成环。重要性按本次学习目标估计。修改已有图时，同一含义只改名或移动保留原 ID。含义改变或拆分合并时用新的 ID，旧 ID 从结果移除。保留未要求改变的手工节点和锁定权重。` : `你是学科教研员。把某个章节拆成一张可供学生自测的知识地图。
+              content: scope ? `你是学科教研员。根据学生的一句话学习描述生成知识网。学段、学科、主题、目标、深度和范围条目均可留空。优先遵守填写的偏好，留空时按描述推断合适的学科、章节名称与内容，不追问。节点数随主题粒度，可只有一个考点和根。不要引入排除项。仅输出 JSON：{"subject":"学科","chapter":"简洁的章节名称","nodes":[{"id":"n1","name":"考点","kind":"root|concept|skill","parentId":null,"prereq":[],"confusable":[],"scopeIds":[],"supplementary":false,"examWeight":0.5,"brief":"一句话讲解"}]}。
+根唯一且没有父级。其余节点有有效父级，并提供一句话讲解。每个填写的纳入项和必要前置都须被关联，只使用输入中的条目 ID。没有纳入项时，按描述自由选取核心内容，无对应条目的节点 scopeIds 留空。补充基础确有必要才加，标 supplementary=true。prereq 只填必学的前置 ID。父级和前置禁止成环。重要性按本次学习目标估计。修改已有图时，同一含义只改名或移动保留原 ID。含义改变或拆分合并时用新的 ID，旧 ID 从结果移除。保留未要求改变的手工节点和锁定权重。` : `你是学科教研员。把某个章节拆成一张可供学生自测的知识地图。
 只输出 JSON，不要任何解释。节点数量 18–32 个，必须覆盖该章节的完整考点。
 每个节点的 brief 一句话（30 字以内，说清"是什么/怎么考"）。
 严格按此结构输出：
@@ -242,7 +253,7 @@ const server = http.createServer(async (req, res) => {
             },
             {
               role: 'user',
-              content: scope ? scopeContext(scope) + '\n变更请求：' + String(body.request || '').slice(0, 1000) +
+              content: scope ? '\n学习描述：' + request + scopeContext(scope) +
                 '\n当前结构：' + JSON.stringify(body.current ?? []).slice(0, 12000) : `考试：${exam}\n科目：${subject}\n章节：${chapter}`
             }
           ]
@@ -257,16 +268,17 @@ const server = http.createServer(async (req, res) => {
         json(res, 502, { error: 'AI 没有返回合法 JSON' })
         return
       }
-      const nodes = Array.isArray(parsed.nodes) ? parsed.nodes : []
+      const nodes = Array.isArray(parsed?.nodes) ? parsed.nodes : []
       if (nodes.length < (scope ? 2 : 5)) {
         json(res, 502, { error: `生成的节点太少（${nodes.length} 个）` })
         return
       }
 
+      const metadata = (value, limit) => typeof value === 'string' ? value.trim().slice(0, limit) : ''
       json(res, 200, {
         exam,
-        subject,
-        chapter,
+        subject: subject || metadata(parsed.subject, 40),
+        chapter: chapter || metadata(parsed.chapter, 60) || metadata(nodes.find((node) => node?.kind === 'root')?.name, 60),
         nodes,
         ms: Date.now() - t0,
         tokens: (data.usage?.prompt_tokens || 0) + (data.usage?.completion_tokens || 0)
@@ -302,7 +314,6 @@ const server = http.createServer(async (req, res) => {
 
       const gen = await upstreamRetry(
         {
-          model: MODEL,
           temperature: 0.8,
           response_format: { type: 'json_object' },
           messages: [
@@ -315,7 +326,9 @@ const server = http.createServer(async (req, res) => {
 题目必须属于「${nodeName}」这个考点，不要出成别的章节的内容。
 题型从 single（四选一）/ blank（填空）/ judge（判断）里挑，不要全是同一种。
 {"questions":[{"type":"single","difficulty":2,"stem":"...","options":["选项1","选项2","选项3","选项4"],"answer":"与某个选项完全一致","solution":"两三句话"}]}
-注意：options 只写内容不要 A. 前缀；公式用普通文本，不要 LaTeX。`
+注意：options 只写内容不要 A. 前缀。阅读题的 stem 必须包含完整文章和提问，段落之间用换行分隔。
+题干、选项和解析中的公式按以下格式写。${FORMULA_FORMAT}
+单选题的 answer 与选项原文完全一致。填空题的 answer 用学生可以直接键入的纯文本，如 3/2、sqrt(2)、H2O。`
             }
           ]
         },
@@ -375,7 +388,6 @@ const server = http.createServer(async (req, res) => {
         try {
           const v = await upstreamRetry(
             {
-              model: MODEL,
               temperature: 0,
               response_format: { type: 'json_object' },
               messages: [
@@ -424,10 +436,11 @@ const server = http.createServer(async (req, res) => {
         keep.push({
           type: q.type,
           difficulty: Math.min(5, Math.max(1, Number(q.difficulty) || 3)),
-          stem: String(q.stem).slice(0, 220),
-          ...(q.options ? { options: q.options.map((o) => String(o).slice(0, 60)) } : {}),
+          stem: q.stem,
+          ...(Array.isArray(q.options) ? { options: q.options.map(String) } : {}),
           answer: q.answer,
-          solution: String(q.solution).slice(0, 300)
+          solution: q.solution,
+          fullText: true
         })
       }
 
@@ -457,7 +470,6 @@ const server = http.createServer(async (req, res) => {
       const t0 = Date.now()
       const data = await upstreamRetry(
         {
-          model: MODEL,
           temperature: 0.5,
           response_format: { type: 'json_object' },
           messages: [
@@ -467,6 +479,7 @@ const server = http.createServer(async (req, res) => {
 要求：
 - 讲透，不要泛泛而谈；每一句都要有信息量，不要复述题干
 - 用学生能直接用的语言，必要处给具体条件、公式、判别步骤
+- ${FORMULA_FORMAT}
 - 涉及考法时要写清"以什么形式出现、怎么下手"，不要只写"常考"
 - 没有把握的具体数据（教材页码、历年考频、真题年份）一律不要写
 - 不要写"根据考纲""据统计"这类我们无法验证的说法`
@@ -494,13 +507,13 @@ const server = http.createServer(async (req, res) => {
       try {
         parsed = JSON.parse(content)
       } catch {
-        parsed = { definition: String(content).slice(0, 900), basics: [], exams: [], keypoints: [] }
+        parsed = { definition: String(content), basics: [], exams: [], keypoints: [] }
       }
       const arr = (v, max = 6) =>
         (Array.isArray(v) ? v : []).map((x) => String(x).trim()).filter(Boolean).slice(0, max)
 
       json(res, 200, {
-        definition: String(parsed.definition || '').slice(0, 1200),
+        definition: String(parsed.definition || ''),
         basics: arr(parsed.basics),
         exams: arr(parsed.exams),
         keypoints: arr(parsed.keypoints),
@@ -520,7 +533,7 @@ const server = http.createServer(async (req, res) => {
     const nodePath = String(body.nodePath || '').slice(0, 120)
     const explain = String(body.explain || '').slice(0, 400)
     // 追问某道题时带来的题目上下文：题干、选项、学生答案、正确答案、解析
-    const context = String(body.context || '').slice(0, 1500)
+    const context = String(body.context || '')
     if (!question) {
       json(res, 400, { error: '缺少 question' })
       return
@@ -529,7 +542,6 @@ const server = http.createServer(async (req, res) => {
     const t0 = Date.now()
     const data = await upstreamRetry(
       {
-        model: MODEL,
         temperature: 0.5,
         response_format: { type: 'json_object' },
         messages: [
@@ -550,11 +562,11 @@ const server = http.createServer(async (req, res) => {
       parsed = { answer: content, cards: [] }
     }
     json(res, 200, {
-      answer: String(parsed.answer || '').slice(0, 600),
+      answer: String(parsed.answer || ''),
       cards: (Array.isArray(parsed.cards) ? parsed.cards : []).slice(0, 2).map((c) => ({
         type: ['conclusion', 'method', 'pitfall', 'formula'].includes(c.type) ? c.type : 'conclusion',
-        front: String(c.front || '').slice(0, 60),
-        back: String(c.back || '').slice(0, 90)
+        front: String(c.front || ''),
+        back: String(c.back || '')
       })),
       ms: Date.now() - t0,
       tokens: (data.usage?.prompt_tokens || 0) + (data.usage?.completion_tokens || 0)
@@ -572,7 +584,7 @@ server.on('error', (error) => {
 server.listen(PORT, HOST, () => {
   const address = server.address()
   const url = `http://${address.address}:${address.port}`
-  console.log(`[ai-proxy] 已启动 ${url}  model=${MODEL}`)
+  console.log(`[ai-proxy] v${version} 已启动 ${url}  model=${MODEL}`)
   if (process.env.GAPGRAPH_RUN_DIR) {
     fs.writeFileSync(path.join(process.env.GAPGRAPH_RUN_DIR, 'ai.json'), JSON.stringify({ url, pid: process.pid }))
     return

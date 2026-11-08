@@ -123,7 +123,7 @@ function Wait-Ready([string]$Name, [string]$File, [string]$HostPattern, $Service
                 $health = Get-LocalPage "$($ready.url)/health" | ConvertFrom-Json
                 if (-not $health.ok -or $health.pid -ne $Proxy.Id) { throw '健康检查没有匹配本次启动的 AI 进程' }
                 if ($Name -eq '网页服务' -and (Get-LocalPage "$($ready.url)/") -notmatch 'id="app"') {
-                    throw '网页尚未返回 GapGraph 页面'
+                    throw '网页尚未返回 KnowMap 页面'
                 }
                 return $ready.url
             } catch {

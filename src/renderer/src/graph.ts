@@ -59,6 +59,7 @@ function el<K extends keyof SVGElementTagNameMap>(tag: K, attrs: Record<string, 
 export interface GraphHandlers {
   onSelect: (id: string | null) => void
   onMoveNode?: (id: string, x: number, y: number) => void
+  onContextMenu?: (id: string, event: MouseEvent) => void
 }
 
 /**
@@ -134,6 +135,7 @@ export class KnowledgeGraph {
 
     this.svg.addEventListener('wheel', this.onWheel, { passive: false })
     this.svg.addEventListener('pointerdown', this.onDown)
+    this.svg.addEventListener('contextmenu', this.onContextMenu)
     window.addEventListener('pointermove', this.onMove)
     window.addEventListener('pointerup', this.onUp)
   }
@@ -141,6 +143,7 @@ export class KnowledgeGraph {
   destroy(): void {
     this.svg.removeEventListener('wheel', this.onWheel)
     this.svg.removeEventListener('pointerdown', this.onDown)
+    this.svg.removeEventListener('contextmenu', this.onContextMenu)
     window.removeEventListener('pointermove', this.onMove)
     window.removeEventListener('pointerup', this.onUp)
   }
@@ -361,6 +364,7 @@ export class KnowledgeGraph {
   }
 
   private onDown = (e: PointerEvent): void => {
+    if (e.button !== 0) return
     const t = e.target as Element
     const nodeEl = t.closest?.('.node') as SVGGElement | null
     this.downAt = { x: e.clientX, y: e.clientY }
@@ -378,6 +382,13 @@ export class KnowledgeGraph {
       return
     }
     this.panFrom = { x: e.clientX, y: e.clientY, tx: this.tx, ty: this.ty }
+  }
+
+  private onContextMenu = (event: MouseEvent): void => {
+    const id = (event.target as Element)?.closest('.node')?.getAttribute('data-id')
+    if (!id || !this.handlers.onContextMenu) return
+    event.preventDefault()
+    this.handlers.onContextMenu(id, event)
   }
 
   private onMove = (e: PointerEvent): void => {
@@ -401,6 +412,7 @@ export class KnowledgeGraph {
   }
 
   private onUp = (e: PointerEvent): void => {
+    if (e.button !== 0) return
     const moved = this.downAt ? Math.hypot(e.clientX - this.downAt.x, e.clientY - this.downAt.y) : 0
     if (this.dragNode) {
       const b = this.boxes.get(this.dragNode.id)

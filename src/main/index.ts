@@ -19,7 +19,7 @@ function createWindow(): void {
     minHeight: 720,
     show: false,
     backgroundColor: '#fbfbfa',
-    title: 'GapGraph 缺口图谱',
+    title: 'KnowMap',
     webPreferences: {
       preload: join(__dirname, '../preload/index.js'),
       contextIsolation: true,

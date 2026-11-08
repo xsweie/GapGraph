@@ -1,4 +1,5 @@
 import './styles.css'
+import 'katex/dist/katex.min.css'
 import type { AppState, ErrorReason, KNode, LearningSignal, LearningUpdate, LoadResult, Mastery, PathStep, Question, SubmitPayload, SubmitResult, Task } from '../../shared/types'
 import { band, effective, selfLevelOf } from '../../shared/mastery'
 import { KnowledgeGraph, type GraphMode } from './graph'
@@ -6,6 +7,7 @@ import { createLocalApi } from './local-api'
 import {
   createDiagnostic,
   diagnosticCoverage,
+  diagnosticTargets,
   DIAG_TARGET,
   nextQuestion,
   primaryNodeOf,
@@ -17,7 +19,7 @@ import { BANDS, buildHeatmap, summarizeHeat } from '../../main/domain/heatmap'
 import { attributionLine, reasonsFor } from '../../main/domain/attribution'
 import aiJson from '../../../resources/ai/gaokao-math-function.json'
 import { addCard, isSaved, loadCards, removeCard } from './cards'
-import { askAi, endpointStatus, explainNode, generateQuestions, getEndpoint, initEndpoint, setEndpoint, type AiAnswer } from './ai'
+import { askAi, endpointStatus, explainNode, generateQuestions, getEndpoint, initEndpoint, setEndpoint, type AiAnswer, type DetailedExplain } from './ai'
 import { explainOf, saveExplain } from './explain'
 import { addToBank } from './qbank'
 import { clearPositions, commitStructure, effectivePack, hasUndo, loadPositions, saveOnePosition, undoStructure } from './edits'
@@ -35,22 +37,34 @@ import {
 } from './sidebar'
 import { builtinPack, currentPack, listPacks, packProgress, questionsOfPack, relTime, removeCustomPack, renamePack, resolvePack, saveCustomPack, saveMergedPack, setActivePackId, markStudied, stateOfPack } from './packs'
 import { canMerge, mergeSources } from '../../main/domain/merge'
-import { assessNode, newEffectiveSince, packRevision, PRACTICE_CHECK_MIN, primaryBranch } from '../../main/domain/learning'
+import { assessNode, newEffectiveSince, packRevision, PRACTICE_CHECK_MIN } from '../../main/domain/learning'
 import { primaryAttemptNode } from '../../main/domain/attempt-log'
 import { activeQuestions } from '../../main/domain/learning-state'
 import { legacyScope } from '../../main/domain/scope'
 import { openScopeEditor } from './scope-editor'
+import { bindNodeEditor } from './node-editor'
+import { escapeHtml as esc, renderStudyText } from './study-text'
+import { bindHelpTips, helpTip } from './help-tip'
 
 /** 实时提问的状态（只保留当前节点的） */
 let askState: { nodeId: string; loading: boolean; answer?: AiAnswer; error?: string } | null = null
 /** 详细讲解的生成状态（按节点，切走再切回来不会互相干扰） */
-let explainState: { nodeId: string; loading: boolean; error?: string } | null = null
+const explainStates = new Map<string, { loading: boolean; error?: string; detail: DetailedExplain | null }>()
+const expandedExplanations = new Set<string>()
 
 /** 正在为哪个考点准备题目（避免重复请求） */
 const preparing = new Set<string>()
 
 function questionsOf(nodeId: string): Question[] {
   return questions.filter((q) => primaryNodeOf(q) === nodeId)
+}
+
+function noQuestionHint(): string {
+  if (desktop) return '这个考点暂缺题目，可以在网页版生成。'
+  const ai = endpointStatus()
+  if (!ai.reachable) return '这个考点暂缺题目。启动 AI 服务后可生成新题。'
+  if (!ai.supportsQuestions) return '当前 AI 代理版本过旧。关闭原启动窗口，重新运行 start.bat 后可生成完整题目。'
+  return '暂未生成可用题目，可以再试一次。'
 }
 
 /**
@@ -178,11 +192,7 @@ let mode: GraphMode = 'structure'
 
 const $ = <T extends Element = HTMLElement>(sel: string): T => document.querySelector(sel) as T
 
-/** 转义：题干和讲解里全是 0<a<1 这种数学符号，不转义会被当成 HTML 标签吞掉 */
-const esc = (s: unknown): string =>
-  String(s ?? '').replace(/[&<>"']/g, (c) =>
-    c === '&' ? '&amp;' : c === '<' ? '&lt;' : c === '>' ? '&gt;' : c === '"' ? '&quot;' : '&#39;'
-  )
+const studyText = (value: unknown): string => renderStudyText(value, pack.scope?.subject || pack.subject)
 
 function nodeById(id: string): KNode | undefined {
   return pack.nodes.find((n) => n.id === id)
@@ -441,6 +451,13 @@ function closeModal(): void {
 /** 大厅里的多选（用于融合板块），只存在内存里 */
 let picked = new Set<string>()
 
+function selectedPacks() {
+  return [...picked].flatMap((id) => {
+    const source = resolvePack(id)
+    return source ? [effectivePack(source)] : []
+  })
+}
+
 function renderHome(): void {
   const box = $('#home')
   const packs = listPacks().filter((entry) => !desktop || entry.builtin)
@@ -451,22 +468,19 @@ function renderHome(): void {
 
   const mergeCheck = (() => {
     if (picked.size < 2) return { ok: false, reason: '勾选 2 个同学科的板块，就能把它们融合成一个' }
-    const chosen = [...picked].map((id) => resolvePack(id)).filter((p): p is NonNullable<typeof p> => !!p)
-    return canMerge(chosen)
+    return canMerge(selectedPacks())
   })()
 
-  const packCards = packs
-    .map((entry) => {
-      const base = resolvePack(entry.id)
-      const pack = base && effectivePack(base)
-      if (!pack) return ''
-      const prog = packProgress(entry.id)
-      const pct = prog.total ? Math.round((prog.measured / prog.total) * 100) : 0
-      const on = picked.has(entry.id)
-      const merged = entry.id.startsWith('merge-')
-      return `<div class="pcard ${on ? 'picked' : ''}" data-pack-card="${entry.id}">
+  const cardsBySubject = new Map<string, string[]>()
+  for (const entry of packs) {
+    const prog = packProgress(entry.id)
+    const pct = prog.total ? Math.round((prog.measured / prog.total) * 100) : 0
+    const on = picked.has(entry.id)
+    const merged = entry.id.startsWith('merge-')
+    const subjectCards = cardsBySubject.get(entry.subject) ?? []
+    subjectCards.push(`<div class="pcard ${on ? 'picked' : ''}" data-pack-card="${entry.id}">
         <div class="pmeta">
-          ${esc([entry.exam, entry.subject].filter(Boolean).join(' · '))}
+          ${esc(entry.exam)}
           <button class="pick ${on ? 'on' : ''}" data-pick="${entry.id}" title="${on ? '取消选择' : '选中（用于融合）'}">${on ? '✓' : '＋'}</button>
         </div>
         <div class="ptitle">${esc(entry.chapter)}</div>
@@ -480,13 +494,19 @@ function renderHome(): void {
           <button class="ghost small" data-rename="${entry.id}">改名</button>
           ${entry.builtin ? '' : `<button class="ghost small" data-drop="${entry.id}">删除</button>`}
         </div>
-      </div>`
-    })
-    .join('')
+      </div>`)
+    cardsBySubject.set(entry.subject, subjectCards)
+  }
+  const packGroups = [...cardsBySubject]
+    .sort(([a], [b]) => Number(!a) - Number(!b))
+    .map(([subject, subjectCards], i) => `<section class="pack-group" aria-labelledby="pack-subject-${i}">
+      <h4 id="pack-subject-${i}">${esc(subject || '未分类')}</h4>
+      <div class="packgrid">${subjectCards.join('')}</div>
+    </section>`).join('')
 
   box.innerHTML = `
     <div class="hhead">
-      <div class="brand">GapGraph<span>缺口图谱</span></div>
+      <div class="brand">KnowMap</div>
       <div class="spacer"></div>
       <button class="ghost small" id="h-cards">知识库 ${cards.length}</button>
       <button class="ghost small" id="h-settings">设置</button>
@@ -521,11 +541,8 @@ function renderHome(): void {
           : ''
       }
 
-      ${
-        packs.length
-          ? `<h3 class="sec">我的板块</h3><div class="packgrid">${packCards}</div>`
-          : `<h3 class="sec">我的板块</h3><div class="emptybox">还没有板块。点上面的「添加板块」开始。</div>`
-      }
+      <h3 class="sec">我的板块</h3>
+      ${packGroups || '<div class="emptybox">还没有板块。点上面的「新建学习板块」开始。</div>'}
 
       <h3 class="sec">知识库</h3>
       ${
@@ -539,7 +556,7 @@ function renderHome(): void {
                  .map(
                    (c) => `<div class="kbrow">
                      <span class="actype ${c.type}">卡片</span>
-                     <span class="kbfront">${esc(c.front)}</span>
+                     <span class="kbfront">${renderStudyText(c.front, packs.find((entry) => entry.id === c.packId)?.subject)}</span>
                      <span class="acfrom">${esc(c.nodeName)}</span>
                    </div>`
                  )
@@ -594,10 +611,7 @@ function renderHome(): void {
 /* ---------------- 融合板块 ---------------- */
 
 async function doMerge(): Promise<void> {
-  const ids = [...picked]
-  const sources = ids
-    .map((id) => resolvePack(id))
-    .filter((p): p is NonNullable<typeof p> => !!p)
+  const sources = selectedPacks()
   const gate = canMerge(sources)
   if (!gate.ok) {
     alert(gate.reason ?? '不能融合')
@@ -617,10 +631,9 @@ async function doMerge(): Promise<void> {
   }
   try {
     const merged = mergeSources(
-      sources.map((p) => {
-        const st = stateOfPack(p)
-        const graph = effectivePack(p)
-        return { pack: graph, questions: activeQuestions(graph, questionsOfPack(p.packId)), mastery: st.mastery, attempts: st.attempts }
+      sources.map((graph) => {
+        const st = stateOfPack(graph)
+        return { pack: graph, questions: activeQuestions(graph, questionsOfPack(graph.packId)), mastery: st.mastery, attempts: st.attempts }
       }),
       title
     )
@@ -641,7 +654,12 @@ async function doMerge(): Promise<void> {
     enterPack(merged.pack.packId)
   } catch (e) {
     alert(`融合失败：${(e as Error).message}`)
-    renderHome()
+    input?.focus()
+  } finally {
+    if (btn) {
+      btn.disabled = false
+      btn.textContent = '融合'
+    }
   }
 }
 
@@ -705,7 +723,7 @@ function mount(): void {
     <div id="home"></div>
     <div class="shell" id="study">
       <header>
-        <div class="brand">GapGraph<span>缺口图谱</span></div>
+        <div class="brand">KnowMap</div>
         <div class="stats">
           <span>已测 <b id="coverage">0/0</b></span>
           <span id="study-goal"></span>
@@ -725,7 +743,6 @@ function mount(): void {
         <button class="ghost small" id="cards-btn">卡片 0</button>
         <button class="ghost small g-only" id="guide-btn">指南</button>
         ${desktop ? '' : '<button class="ghost small" id="edit-scope">范围与结构</button>'}
-        <button class="ghost small" id="chapter-btn">章节</button>
         <button class="ghost small" id="lobby-btn">大厅</button>
         <button class="ghost small" id="settings-btn">设置</button>
       </header>
@@ -743,16 +760,22 @@ function mount(): void {
           <svg id="graph" data-mode="structure"></svg>
           <div id="phys" class="physpanel"></div>
           <div class="legend">
-            <span><i style="background:var(--c1)"></i>估计偏低</span>
-            <span><i style="background:var(--c2)"></i>较低</span>
-            <span><i style="background:var(--c3)"></i>中等</span>
-            <span><i style="background:var(--c5)"></i>较高</span>
-            <span><i class="hollow"></i>自评待验证</span>
-            <span><i style="background:var(--c0)"></i>没测过</span>
-            <span><span class="line"></span>结构（谁是谁的下一层）</span>
-            <span><span class="line pre"></span>前置（要先会）</span>
-            <span><span class="line con"></span>易混（点节点看）</span>
-            <span class="hint">节点可拖动摆位置</span>
+            <button class="small" type="button" data-help data-help-template="graph-legend"
+              aria-description="颜色表示能力估计，灰色表示未测，虚线圈表示自评待验证。实线表示层级，虚线表示前置，点线表示易混。">图例 <span aria-hidden="true">?</span></button>
+            <template id="graph-legend">
+              <div class="legend-items">
+                <span><i style="background:var(--c1)"></i>估计偏低</span>
+                <span><i style="background:var(--c2)"></i>较低</span>
+                <span><i style="background:var(--c3)"></i>中等</span>
+                <span><i style="background:var(--c5)"></i>较高</span>
+                <span><i class="hollow"></i>自评待验证</span>
+                <span><i style="background:var(--c0)"></i>没测过</span>
+                <span><span class="line"></span>结构层级</span>
+                <span><span class="line pre"></span>必要前置</span>
+                <span><span class="line con"></span>易混关系</span>
+              </div>
+              <div class="legend-note">${desktop ? '拖动节点可调整位置' : '拖动节点调整位置，右键增删考点。'}</div>
+            </template>
           </div>
           <div id="heat"></div>
         </section>
@@ -765,19 +788,29 @@ function mount(): void {
     <div id="settings"></div>
     <div id="cards"></div>
     <div id="wizard"></div>
+    <div id="help-tooltip" class="help-tooltip" role="tooltip" hidden></div>
+    ${desktop ? '' : '<div id="node-menu" class="node-menu" role="group" hidden></div><dialog id="node-editor" class="gsheet scope-sheet node-dialog" aria-labelledby="node-edit-title"></dialog>'}
   `
 
+  bindHelpTips($('#help-tooltip'))
   $('#guide-btn').addEventListener('click', () => renderGuide())
   $('#settings-btn').addEventListener('click', () => renderSettings())
   $('#cards-btn').addEventListener('click', () => renderCards())
-  $('#chapter-btn').addEventListener('click', () => renderWizard())
   $('#lobby-btn').addEventListener('click', () => {
     location.hash = ''
     location.reload()
   })
 
+  const openNodeMenu = desktop ? undefined : bindNodeEditor($('#node-menu'), $('#node-editor'), async (original, candidate, focusId) => {
+    const base = currentPack()
+    if (!base) throw new Error('请重新打开当前板块后再编辑。')
+    await commitStructure(base, packRevision(original), candidate)
+    history.replaceState({ structureFocusId: focusId }, '', '#study')
+    location.reload()
+  })
   graph = new KnowledgeGraph($('#graph') as unknown as SVGSVGElement, {
     onSelect: (id) => selectNode(id),
+    onContextMenu: openNodeMenu && ((id, event) => openNodeMenu(pack, id, event)),
     // 拖完立刻记下来，下次打开还在原地
     onMoveNode: (id, x, y) => {
       saveOnePosition(pack.packId, id, x, y)
@@ -834,7 +867,7 @@ function mount(): void {
 
 function renderHeader(): void {
   $('#coverage').textContent = overview.coverage.measured + '/' + overview.coverage.total
-  $('#study-goal').textContent = pack.scope?.goal ?? '补齐本板块'
+  $('#study-goal').textContent = pack.scope?.goal || '补齐本板块'
   const btn = $('#cards-btn')
   if (btn) btn.textContent = `卡片 ${loadCards().length}`
 }
@@ -844,6 +877,7 @@ function renderHeader(): void {
 function renderCards(): void {
   const box = $('#cards')
   const cards = loadCards().sort((a, b) => b.at - a.at)
+  const subjects = new Map(listPacks().map(({ id, subject }) => [id, subject]))
   const typeName: Record<string, string> = { conclusion: '结论', method: '方法', pitfall: '易错', formula: '公式' }
 
   box.innerHTML = `
@@ -866,8 +900,8 @@ function renderCards(): void {
                     <span class="acfrom">${esc(c.nodeName)}</span>
                     <button class="star on" data-del="${esc(c.id)}" title="删除">★</button>
                   </div>
-                  <div class="acfront">${esc(c.front)}</div>
-                  <div class="acback">${esc(c.back)}</div>
+                  <div class="acfront study-text">${renderStudyText(c.front, subjects.get(c.packId ?? ''))}</div>
+                  <div class="acback study-text">${renderStudyText(c.back, subjects.get(c.packId ?? ''))}</div>
                 </div>`
               )
               .join('')}</div>`
@@ -981,19 +1015,23 @@ function renderPlanning(): void {
       const task = taskMatches(step)
       const blocked = step.invalid || step.blockedBy.length > 0
       const qCount = questionsOf(step.nodeId).length
+      const info = [step.evidence, blocked ? '' : step.reason,
+        !step.done && !blocked ? (task ? '今日任务 · ' : '') + (qCount ? qCount + ' 道可用题' : '缺题，可尝试准备') : ''
+      ].filter(Boolean).join('\n')
       return `<article class="card path-step ${step.done ? 'done' : ''} ${step.id === planning.current ? 'current' : ''}" data-path-step="${esc(step.id)}">
         <div class="kind">${step.done ? '已完成' : step.invalid ? '结构待修正' : blocked ? '等待前置' : actionName[step.action]}</div>
-        <button class="path-node ghost" data-focus-step="${esc(step.id)}">${esc(nodeById(step.nodeId)?.name ?? step.nodeId)}</button>
-        <div class="meta">${esc(step.evidence)}</div><p class="meta">${esc(step.reason)}</p>
-        ${!step.done && !blocked ? `<div class="actions"><button class="primary small" data-run-step="${esc(step.id)}">开始${actionName[step.action]}</button></div>
-          <div class="hint">${task ? '今日任务 · ' : ''}${qCount ? qCount + ' 道可用题' : '缺题，可尝试准备'}</div>` : ''}
+        <div class="path-title"><button class="path-node ghost" data-focus-step="${esc(step.id)}">${esc(nodeById(step.nodeId)?.name ?? step.nodeId)}</button>
+          ${helpTip('规划依据', info)}</div>
+        ${blocked ? `<p class="meta">${esc(step.reason)}</p>` : ''}
+        ${!step.done && !blocked ? `<div class="actions"><button class="primary small" data-run-step="${esc(step.id)}">开始${actionName[step.action]}</button></div>` : ''}
       </article>`
     })
+    const scope = legacyScope(pack)
+    const pathInfo = [scope.goal || '补齐本板块', scope.depth,
+      path && `路径 v${path.version} · ${path.reason}\n最近检查 ${new Date(path.checkedAt).toLocaleString('zh-CN')}`].filter(Boolean).join('\n')
     box.innerHTML = top + `
-      <h3 class="plan-title">${esc(pack.title)}</h3>
-      <p class="gsub">${esc(legacyScope(pack).goal)} · ${esc(legacyScope(pack).depth)}</p>
+      <h3 class="plan-title">${esc(pack.title)} ${helpTip('路径与学习目标', pathInfo)}</h3>
       <p>${status}${coverageText}</p>
-      ${path ? `<p class="gsub">路径 v${path.version} · ${esc(path.reason)} · 最近检查 ${new Date(path.checkedAt).toLocaleString('zh-CN')}</p>` : ''}
       <p><strong>下一步</strong> ${first ? esc(actionName[first.action] + ' · ' + (nodeById(first.nodeId)?.name ?? first.nodeId)) : '暂无可执行步骤'}</p>
       <div class="scope-actions">
         <button id="plan-rebuild" class="small">重新规划</button>
@@ -1063,14 +1101,13 @@ function renderDaily(): void {
     ? '当前动作未装入剩余预算，或已推迟。' : blocked ? '后续步骤正在等待前置或结构修正。' : '暂无待办。'
   box.innerHTML = `
     <div class="card intro">
-      <div class="name">渐进摸底</div>
-      <div class="meta">最多提交 ${DIAG_TARGET} 次，优先覆盖主要分支。可以跳过，随时打开初步规划。</div>
+      <div class="name">渐进摸底 ${helpTip('摸底规则', `最多提交 ${DIAG_TARGET} 次，优先覆盖主要分支。可以跳过，随时打开初步规划。`)}</div>
       <div class="actions"><button class="small" id="diag-start">${resumable ? '继续摸底' : '开始摸底'}</button></div>
     </div>
     <div class="col-title">今日任务 · ${pending.length} 项待开始</div>
     ${rows.join('')}
     ${pending.length ? '' : `<p class="panel-empty">${empty}</p>`}
-    <div class="hint">每日上限 ${state.settings.dailyMinutes} 分钟 · 已用 ${Math.ceil(spent)} 分钟 · 最多三张卡</div>`
+    <div class="hint">已用 ${Math.ceil(spent)} / ${state.settings.dailyMinutes} 分钟 ${helpTip('今日任务预算', '每日最多安排三张任务卡，按剩余时间和学习路径安排。')}</div>`
   box.querySelector('#diag-start')?.addEventListener('click', () => void startDiagnostic())
   box.querySelectorAll<HTMLButtonElement>('[data-start]').forEach((button) => {
     button.addEventListener('click', () => {
@@ -1105,7 +1142,7 @@ async function startAction(nodeId: string, task?: Task, step?: PathStep, button?
   }
   if (session) return
   if (!qs.length) {
-    alert('暂缺有效题目。可以继续看讲解或做其他任务，AI 服务可用后再试。')
+    alert(noQuestionHint())
     return
   }
   openPractice(qs.slice(0, limit).map((q) => q.id), nodeId, task?.id ?? null, targeted, step?.id)
@@ -1115,15 +1152,7 @@ async function startAction(nodeId: string, task?: Task, step?: PathStep, button?
 function renderPanel(): void {
   const box = $('#panel')
   if (!selectedId) {
-    box.innerHTML = `
-      <div class="panel-empty">
-        点图上的任意一个圆，这里会显示它的讲解、掌握度和可做的题。
-        <ul>
-          <li>颜色表示能力估计，灰色表示未知</li>
-          <li>虚线圈表示已自评、待验证</li>
-          <li>用右上角「规划」查看下一步和证据</li>
-        </ul>
-      </div>`
+    box.innerHTML = '<div class="panel-empty">选一个考点，查看讲解和练习。</div>'
     return
   }
   const n = nodeById(selectedId)
@@ -1140,10 +1169,15 @@ function renderPanel(): void {
   const aiReady = endpointStatus()
   const canGen = !desktop && aiReady.reachable && aiReady.supportsQuestions
   // 详细讲解：先读缓存，再看是否正在为这个节点生成
-  const detail = explainOf(pack.packId, n.id)
-  const exSt = explainState && explainState.nodeId === n.id ? explainState : null
+  const exSt = explainStates.get(n.id)
+  const detail = exSt?.detail ?? explainOf(pack.packId, n.id)
   const explainLoading = !!exSt?.loading
   const explainError = exSt?.error ?? ''
+  const explainButton = `<button class="ghost small explain-btn" id="explain-more" ${explainLoading ? 'disabled' : ''}>
+    ${explainLoading ? '生成中…' : detail ? '重新生成' : '生成详细讲解'}
+  </button>`
+  const selfLevel = selfLevelOf(m)
+  const selfRating = { none: '没学过', weak: '学过不会', basic: '会', unknown: '未填写' }[selfLevel]
 
   box.innerHTML = `
     <div class="pname-row">
@@ -1155,33 +1189,31 @@ function renderPanel(): void {
       <div class="score-big ${touched ? '' : 'na'}">${touched ? eff.M.toFixed(2) : '未测'}</div>
       <div class="pill">${esc(assessment.label)}</div>
       <div class="pill">可信度 ${(eff.conf * 100).toFixed(0)}%</div>
+      ${helpTip('掌握度依据', [assessment.evidence, assessment.due ? '已到复习时间' : '当前未到期', weightNote(n)].join('\n'))}
     </div>
     <div class="bar"><i style="width:${Math.round(eff.M * 100)}%;background:${BAND_COLOR[b]}"></i></div>
-    <div class="hint">${esc(assessment.evidence)} · ${assessment.due ? '已到复习时间' : '当前未到期'} · ${weightNote(n)}</div>
     ${n.kind !== 'root' ? `<div class="scope-actions"><button class="small" id="node-detect">测一下这个点</button>
       <button class="small" id="node-confused">我还是不懂</button>${desktop ? '' : '<button class="small" id="node-edit">调整范围与结构</button>'}</div>` : ''}
 
     <div class="block">
-      <h3>讲解
-        <button class="ghost small explain-btn" id="explain-more" ${explainLoading ? 'disabled' : ''}>
-          ${explainLoading ? '生成中…' : detail ? '重新生成详细版' : '展开详细版'}
-        </button>
-      </h3>
-      <p>${esc((content?.explain ?? n.brief) ?? '（暂无讲解）')}</p>
+      <h3>讲解 ${detail ? '' : explainButton}</h3>
+      <p class="study-text">${studyText((content?.explain ?? n.brief) ?? '（暂无讲解）')}</p>
       ${
         explainError
-          ? `<div class="hint" style="color:#a52222">${esc(explainError)}</div>`
+          ? `<div class="hint" role="alert" style="color:#a52222">${esc(explainError)}</div>`
           : ''
       }
       ${
         detail
-          ? `<div class="xdetail">
+          ? `<details class="explain-detail" id="node-detail" ${expandedExplanations.has(n.id) ? 'open' : ''}>
+             <summary><span class="explain-show">展开详细讲解</span><span class="explain-hide">收起详细讲解</span></summary>
+             <div class="xdetail">
                <div class="xsec">
                  <div class="xhead">定义与基础认知</div>
-                 <p class="xtext">${esc(detail.definition)}</p>
+                 <p class="xtext study-text">${studyText(detail.definition)}</p>
                  ${
                    detail.basics.length
-                     ? `<ul class="xlist">${detail.basics.map((s) => `<li>${esc(s)}</li>`).join('')}</ul>`
+                     ? `<ul class="xlist">${detail.basics.map((s) => `<li class="study-text">${studyText(s)}</li>`).join('')}</ul>`
                      : ''
                  }
                </div>
@@ -1189,7 +1221,7 @@ function renderPanel(): void {
                  detail.exams.length
                    ? `<div class="xsec">
                         <div class="xhead">涉及的考法</div>
-                        <ul class="xlist">${detail.exams.map((s) => `<li>${esc(s)}</li>`).join('')}</ul>
+                        <ul class="xlist">${detail.exams.map((s) => `<li class="study-text">${studyText(s)}</li>`).join('')}</ul>
                       </div>`
                    : ''
                }
@@ -1197,12 +1229,12 @@ function renderPanel(): void {
                  detail.keypoints.length
                    ? `<div class="xsec">
                         <div class="xhead">知识点</div>
-                        <ul class="xlist">${detail.keypoints.map((s) => `<li>${esc(s)}</li>`).join('')}</ul>
+                        <ul class="xlist">${detail.keypoints.map((s) => `<li class="study-text">${studyText(s)}</li>`).join('')}</ul>
                       </div>`
                    : ''
                }
-               <div class="hint">生成于 ${new Date(detail.at).toLocaleString('zh-CN')} · 由 AI 现写，可能有错，拿不准就在下面追问</div>
-             </div>`
+               <div class="explain-footer">${explainButton} ${helpTip('讲解来源', `生成于 ${new Date(detail.at).toLocaleString('zh-CN')}。\n由 AI 生成，存疑时可以追问。`)}</div>
+             </div></details>`
           : ''
       }
     </div>
@@ -1212,7 +1244,7 @@ function renderPanel(): void {
       if (!cards.length) return ''
       const typeName: Record<string, string> = { conclusion: '结论', method: '方法', pitfall: '易错', formula: '公式' }
       return `<div class="block">
-          <h3>卡片 <span class="hint">（点 ☆ 收藏，之后在顶栏「卡片」里能翻）</span></h3>
+          <h3>卡片 ${helpTip('收藏卡片', '点 ☆ 收藏，之后在顶栏「卡片」查看。')}</h3>
           ${cards
             .map((c) => {
               const saved = isSaved(pack.packId, n.id, c.front)
@@ -1221,8 +1253,8 @@ function renderPanel(): void {
                   <span class="actype ${c.type}">${typeName[c.type] ?? c.type}</span>
                   <button class="star ${saved ? 'on' : ''}" data-star="${encodeURIComponent(c.front)}" title="${saved ? '取消收藏' : '收藏这张卡'}">${saved ? '★' : '☆'}</button>
                 </div>
-                <div class="acfront">${esc(c.front)}</div>
-                <div class="acback">${esc(c.back)}</div>
+                <div class="acfront study-text">${studyText(c.front)}</div>
+                <div class="acback study-text">${studyText(c.back)}</div>
               </div>`
             })
             .join('')}
@@ -1243,16 +1275,15 @@ function renderPanel(): void {
     })()}
 
     <div class="block">
-      <h3>还有疑问？直接问 AI</h3>
+      <h3>AI 答疑 ${helpTip('答疑上下文', '实时答疑会发送当前考点、学习范围和本次问题。')}</h3>
       ${(() => {
         const ai = endpointStatus()
         if (!ai.endpoint || !ai.reachable) {
-          const why = ai.endpoint ? `连不上 ${esc(ai.endpoint)}` : '未检测到 AI 服务'
-          return `<div class="hint">实时 AI 未连接（${why}）。先运行 <code>node scripts/ai-proxy.cjs</code>，再到「设置 → AI 服务地址」填 <code>http://127.0.0.1:3300</code>。<br>（不连也能用：上面的讲解和卡片是预生成好的，离线可看）</div>`
+          const why = ai.endpoint ? `连不上 ${ai.endpoint}。` : '未检测到 AI 服务。'
+          return `<div class="hint">AI 服务未连接 ${helpTip('连接 AI 服务', why + '可用 start.bat 启动，或在设置中检查 AI 服务地址。讲解和卡片仍可离线查看。')}</div>`
         }
         const st = askState && askState.nodeId === n.id ? askState : null
         return `
-          <div class="hint">实时答疑会发送当前考点、学习范围和本次问题。</div>
           <div class="askrow">
             <input id="ask-input" ${st?.loading ? 'disabled' : ''} />
             <button class="primary small" id="ask-btn" ${st?.loading ? 'disabled' : ''}>${st?.loading ? '思考中…' : '问'}</button>
@@ -1268,18 +1299,18 @@ function renderPanel(): void {
           ${
             st?.answer
               ? `<div class="aianswer">
-                   <div class="aatext">${esc(st.answer.answer)}</div>
+                   <div class="aatext study-text">${studyText(st.answer.answer)}</div>
                    ${st.answer.cards
                      .map(
                        (c) => `<div class="aicard" style="margin-top:8px">
                          <div class="achead"><span class="actype">卡片</span>
                          <button class="star ${isSaved(pack.packId, n.id, c.front) ? 'on' : ''}" data-star="${encodeURIComponent(c.front)}" data-json="${encodeURIComponent(JSON.stringify(c))}">${isSaved(pack.packId, n.id, c.front) ? '★' : '☆'}</button></div>
-                         <div class="acfront">${esc(c.front)}</div>
-                         <div class="acback">${esc(c.back)}</div>
+                         <div class="acfront study-text">${studyText(c.front)}</div>
+                         <div class="acback study-text">${studyText(c.back)}</div>
                        </div>`
                      )
                      .join('')}
-                   <div class="hint" style="margin-top:6px">${st.answer.ms}ms</div>
+                   ${helpTip('答疑耗时', `本次答疑耗时 ${st.answer.ms} ms。`)}
                  </div>`
               : ''
           }`
@@ -1287,19 +1318,18 @@ function renderPanel(): void {
     </div>
 
     <div class="block">
-      <h3>你学过吗</h3>
+      <h3>你学过吗 ${helpTip('自评说明', `当前自评：${selfRating}。自评记录你的感受，能力由有效答题更新。`)}</h3>
       <div class="chiprow" id="rate">
-        <span class="chip" data-level="0">没学过</span>
-        <span class="chip" data-level="1">学过不会</span>
-        <span class="chip" data-level="2">会</span>
+        <button class="chip" data-level="0" aria-pressed="${selfLevel === 'none'}">没学过</button>
+        <button class="chip" data-level="1" aria-pressed="${selfLevel === 'weak'}">学过不会</button>
+        <button class="chip" data-level="2" aria-pressed="${selfLevel === 'basic'}">会</button>
       </div>
-      <div class="hint">当前自评：${{ none: '没学过', weak: '学过不会', basic: '会', unknown: '未填写' }[selfLevelOf(m)]}。自评是主观记录，能力由有效答题更新。</div>
     </div>
 
     ${
       foundationChain(n.id).length
         ? `<div class="block">
-             <h3>必要前置（未知先验证）</h3>
+             <h3>必要前置 ${helpTip('前置学习顺序', '从左到右复习。掌握情况未知的基础先做检测。')}</h3>
              <div class="chain">${foundationChain(n.id)
                .map((p) => `<span class="chip" data-goto="${esc(p)}">${esc(nodeById(p)?.name ?? p)}</span>`)
                .join('<span class="sep">→</span>')}<span class="sep">→</span><span class="here">${esc(n.name)}</span></div>
@@ -1309,35 +1339,35 @@ function renderPanel(): void {
 
     ${
       n.prereq.length
-        ? `<div class="block"><h3>前置（不会它，这一节学不动）</h3><ul class="rels">${n.prereq
-            .map(
-              (p) =>
-                `<li><span class="chip" data-goto="${esc(p)}">${esc(nodeById(p)?.name ?? p)}</span><span class="why">${esc(whyOf(p, n.id, 'prereq'))}</span></li>`
-            )
+        ? `<div class="block"><h3>前置 ${helpTip('前置考点', '学这个考点前需要掌握的内容。')}</h3><ul class="rels">${n.prereq
+            .map((p) => {
+              const why = whyOf(p, n.id, 'prereq')
+              return `<li><span class="chip" data-goto="${esc(p)}">${esc(nodeById(p)?.name ?? p)}</span>${why ? helpTip('前置关系说明', why) : ''}</li>`
+            })
             .join('')}</ul></div>`
         : ''
     }
 
     ${
       n.confusable.length
-        ? `<div class="block"><h3>容易混（放在一起对比练）</h3><ul class="rels">${n.confusable
-            .map(
-              (p) =>
-                `<li><span class="chip conf" data-goto="${esc(p)}">⇄ ${esc(nodeById(p)?.name ?? p)}</span><span class="why">${esc(whyOf(n.id, p, 'confusable'))}</span></li>`
-            )
+        ? `<div class="block"><h3>容易混 ${helpTip('易混考点', '可以把容易混淆的考点放在一起对比练习。')}</h3><ul class="rels">${n.confusable
+            .map((p) => {
+              const why = whyOf(n.id, p, 'confusable')
+              return `<li><span class="chip conf" data-goto="${esc(p)}">⇄ ${esc(nodeById(p)?.name ?? p)}</span>${why ? helpTip('易混关系说明', why) : ''}</li>`
+            })
             .join('')}</ul></div>`
         : ''
     }
 
     <div class="block">
-      <h3>题目</h3>
-      <p style="font-size:13px">${
+      <h3>题目 ${
         qs.length
-          ? `这个考点已有 ${qs.length} 道题`
+          ? `· ${qs.length} 道`
           : canGen
-            ? '这个考点还没有题。点下面的按钮，现出 3 道（约 6 秒）——不预生成，用到才出。'
-            : '这个考点还没有题。运行 <code>node scripts/ai-proxy.cjs</code> 并刷新页面，就能现场出题。'
-      }</p>
+            ? helpTip('按需出题', '点下方按钮为这个考点现场生成 3 道题。')
+            : ''
+      }</h3>
+      ${!qs.length && !canGen ? `<p>${esc(noQuestionHint())}</p>` : ''}
       <div style="margin-top:8px">
         <button class="primary small" id="practice" ${qs.length || canGen ? '' : 'disabled'}>${
           qs.length ? '做 3 道' : canGen ? '现出 3 道题' : '做 3 道'
@@ -1414,13 +1444,19 @@ function renderPanel(): void {
     })
   }
   /* 详细讲解：当场生成并把结果按板块缓存下来 */
+  const detailSection = box.querySelector<HTMLDetailsElement>('#node-detail')
+  detailSection?.addEventListener('toggle', () => {
+    if (!detailSection.isConnected) return
+    if (detailSection.open) expandedExplanations.add(n.id)
+    else expandedExplanations.delete(n.id)
+  })
   box.querySelector('#explain-more')?.addEventListener('click', async () => {
     if (!aiReady.reachable) {
-      explainState = { nodeId: n.id, loading: false, error: 'AI 服务没连上，先运行 node scripts/ai-proxy.cjs' }
+      explainStates.set(n.id, { detail, loading: false, error: 'AI 服务未连接，请运行 start.bat。' })
       renderPanel()
       return
     }
-    explainState = { nodeId: n.id, loading: true }
+    explainStates.set(n.id, { detail, loading: true })
     renderPanel()
     try {
       const res = await explainNode({
@@ -1433,17 +1469,18 @@ function renderPanel(): void {
         scope: pack.scope
       })
       if (!res) {
-        explainState = { nodeId: n.id, loading: false, error: 'AI 服务没连上' }
+        explainStates.set(n.id, { detail, loading: false, error: 'AI 服务没连上' })
       } else if (!res.definition && !res.basics.length && !res.exams.length && !res.keypoints.length) {
-        explainState = { nodeId: n.id, loading: false, error: 'AI 这次没返回内容，稍后再试一次' }
+        explainStates.set(n.id, { detail, loading: false, error: 'AI 这次没返回内容，稍后再试一次' })
       } else {
         saveExplain(pack.packId, n.id, res)
-        explainState = { nodeId: n.id, loading: false }
+        explainStates.set(n.id, { detail: res, loading: false })
+        if (!detail) expandedExplanations.add(n.id)
       }
     } catch (e) {
-      explainState = { nodeId: n.id, loading: false, error: `生成失败：${(e as Error).message}` }
+      explainStates.set(n.id, { detail, loading: false, error: `生成失败：${(e as Error).message}` })
     }
-    renderPanel()
+    if (selectedId === n.id) renderPanel()
   })
 
   box.querySelectorAll<HTMLElement>('#rate .chip').forEach((c) => {
@@ -1472,12 +1509,7 @@ function renderPanel(): void {
     const ok = await ensureQuestions(n.id, 3)
     if (!ok) {
       pbtn.textContent = '出题失败'
-      const ai = endpointStatus()
-      alert(
-        ai.reachable && ai.supportsQuestions
-          ? '出题没成功，可以再点一次。'
-          : '这个考点还没有题。运行 node scripts/ai-proxy.cjs 并刷新，就能现场出题。'
-      )
+      alert(noQuestionHint())
       renderPanel()
       return
     }
@@ -1522,7 +1554,7 @@ function renderHeat(): void {
   const now = Date.now()
   const rows = buildHeatmap({
     nodes: pack.nodes,
-    questions,
+    questions: desktop ? questions : activeQuestions(pack, questionsOfPack(pack.packId)),
     attempts: state.attempts,
     mastery: state.mastery,
     now,
@@ -1562,8 +1594,7 @@ function renderHeat(): void {
       <b class="warn">${rows.filter((row) => assessNode(state, row.nodeId, now).action === 'gap').length}</b> 个有依据的缺口 ·
       <b>${sum.unmeasured}</b> 个没测过
       ${sum.excluded ? `<span class="hsep">|</span><span class="hint-inline">已剔除 ${sum.excluded} 条疑似蒙对</span>` : ''}
-      <span class="hsep">|</span>
-      格子里的「2/3」= 这个难度做对 2 次共 3 次；「—」表示还没做过这个难度
+      ${helpTip('热力表读法', '格子中的「2/3」表示该难度做对 2 次，共作答 3 次。「—」表示还没做过该难度。')}
     </div>
     <table class="heat">
       <thead>
@@ -1922,10 +1953,7 @@ async function startDiagnostic(): Promise<void> {
     const diag: DiagState = { ...(saved && !saved.finished ? saved : createDiagnostic()), revision }
     let first = nextQuestion(diag, questions, pack.nodes, state.mastery)
     if (!first && !diagnosticCoverage(diag, pack.nodes).ready && diag.askedIds.length < DIAG_TARGET) {
-      const branches = new Set(diag.answered.filter((a) => !a.guessed).map((a) => primaryBranch(a.nodeId, pack.nodes)))
-      const root = pack.nodes.find((n) => n.kind === 'root')
-      const targets = pack.nodes.filter((n) => n.parentId === root?.id)
-        .sort((a, b) => Number(branches.has(a.id)) - Number(branches.has(b.id))).slice(0, 3)
+      const targets = diagnosticTargets(diag, questions, pack.nodes)
       if (button) button.textContent = '准备摸底题…'
       await Promise.all(targets.map((n) => ensureQuestions(n.id, questionsOf(n.id).length + 2)))
       first = nextQuestion(diag, questions, pack.nodes, state.mastery)
@@ -2001,8 +2029,9 @@ function renderModal(): void {
       <div class="sheet">
         <div class="qhead"><span>本轮摸底</span><span>${diagResult.answered}/${DIAG_TARGET} 次提交</span></div>
         <div class="stem">${progress.ready ? '已获得初步画像' : '证据有限'}</div>
-        <p>${progress.effective} 道不同的有效题，覆盖 ${progress.covered}/${progress.branches} 个主分支。门槛为 6 道有效题及 ${progress.required} 个主分支。未测考点继续显示未知。</p>
-        ${progress.ready ? '' : '<p class="gsub">题库或覆盖不足时可先学习，之后继续摸底或通过定点检测补证据。</p>'}
+        <p>${progress.effective} 道不同的有效题 · ${progress.covered}/${progress.branches} 个主分支
+          ${helpTip('摸底结果说明', `初步画像需要 6 道有效题和 ${progress.required} 个主分支。未测考点显示未知。` +
+            (progress.ready ? '' : '可以先学习，之后继续摸底，或用定点检测补充证据。'))}</p>
         ${
           diagResult.weakest.length
             ? `<div class="block"><h3>可进一步定点验证</h3>
@@ -2047,7 +2076,7 @@ function renderModal(): void {
     inputHtml = `<div class="opts">${(q.options ?? [])
       .map(
         (o, i) =>
-          `<button class="opt ${session!.answer === o ? 'sel' : ''}" data-opt="${i}">${String.fromCharCode(65 + i)}. ${esc(o)}</button>`
+          `<button class="opt study-text ${session!.answer === o ? 'sel' : ''}" data-opt="${i}">${String.fromCharCode(65 + i)}. ${studyText(o)}</button>`
       )
       .join('')}</div>`
   } else if (q.type === 'judge') {
@@ -2066,13 +2095,13 @@ function renderModal(): void {
          ${session.last.guessed ? ' · 这条不计入掌握分（疑似蒙对）' : ''}
          <span class="delta"> ${session.last.before.toFixed(2)} → ${session.last.after.toFixed(2)}</span>
          <span class="bandshift">${BAND_NAME[session.last.beforeBand]} → ${BAND_NAME[session.last.afterBand]}</span>
-         ${session.last.solution ? `<div style="margin-top:6px;color:#444">${esc(session.last.solution)}</div>` : ''}
+         ${session.last.solution ? `<div class="study-text" style="margin-top:6px;color:#444">${studyText(session.last.solution)}</div>` : ''}
        </div>`
       : ''
 
   const reasonHtml = askingReason
     ? `<div class="reasonbox">
-         <div class="rtitle">这题错在哪？<span>选一个，软件据此决定下次推什么</span></div>
+         <div class="rtitle">这题错在哪？ ${helpTip('错因说明', '错因用于调整后续推荐。跳过仍会记录这次作答。')}</div>
          <div class="rchips">
            ${reasonsFor(pack.meta?.subject).map((r) => `<button class="rc" data-reason="${r.key}" title="${r.hint}">${r.label}</button>`).join('')}
          </div>
@@ -2085,7 +2114,7 @@ function renderModal(): void {
   const askChips = askPresetsFor(q, qNode?.name ?? '', answered ? session.last?.correct : undefined)
   const askHtml = answered
     ? `<div class="askbox">
-         <div class="askhead"><b>对这题还有疑问？</b><span>追问会发送当前范围和题目所需上下文</span></div>
+         <div class="askhead"><b>对这题还有疑问？</b>${helpTip('追问上下文', '追问会发送当前学习范围和这道题的相关内容。')}</div>
          <div class="askchips">${askChips.map((p) => `<button class="askchip" data-ask="${esc(p)}">${esc(p)}</button>`).join('')}</div>
          ${qNode ? '<div class="scope-actions"><button class="small" id="q-confused">我还是不懂</button><button class="small" id="q-detect">测一下这个点</button></div>' : ''}
          <div class="askrow">
@@ -2098,7 +2127,7 @@ function renderModal(): void {
            askTurns.length
              ? `<div class="asklog">${askTurns
                  .map(
-                   (t) => `<div class="askitem"><div class="askq">${esc(t.q)}</div><div class="aska">${esc(t.a)}</div></div>`
+                   (t) => `<div class="askitem"><div class="askq study-text">${studyText(t.q)}</div><div class="aska study-text">${studyText(t.a)}</div></div>`
                  )
                  .join('')}</div>`
              : ''
@@ -2113,7 +2142,7 @@ function renderModal(): void {
         <span>${session.diag ? '按分支渐进选题' : session.targeted ? '定点检测' : (KIND_LABEL[(today.find((t) => t.id === session!.taskId)?.kind ?? 'gap') as string] ?? '')}</span>
       </div>
       ${session.diag ? `<div class="diagbar"><i style="width:${Math.round((session.diag.askedIds.length / DIAG_TARGET) * 100)}%"></i></div>` : ''}
-      <div class="stem">${esc(q.stem)}</div>
+      <div class="stem study-text">${studyText(q.stem)}</div>
       ${inputHtml}
       ${reasonHtml}
       ${fb}
@@ -2123,7 +2152,7 @@ function renderModal(): void {
           answered
             ? `<button class="primary" id="next">${session.index + 1 < total ? '下一题' : '完成'}</button>`
             : askingReason
-              ? `<span class="hint">跳过也能记，只是少了这条线索</span><div class="spacer"></div><button class="ghost small" id="skip-reason">跳过</button>`
+              ? `<div class="spacer"></div><button class="ghost small" id="skip-reason">跳过</button>`
               : `<div class="conf-toggle" data-picked="${session.confidence ? '1' : '0'}">
                  <button class="small" data-conf="sure" aria-pressed="${session.confidence === 'sure'}">我很确定</button>
                  <button class="small" data-conf="unsure" aria-pressed="${session.confidence === 'unsure'}">不确定</button>
@@ -2346,8 +2375,14 @@ async function bootInner(): Promise<void> {
 
   renderHeader()
   renderToday()
+  const focusId = history.state?.structureFocusId as string | undefined
+  if (focusId) {
+    history.replaceState(null, '')
+    selectedId = nodeById(focusId)?.id ?? null
+  }
   renderPanel()
   refreshVisuals()
+  graph.select(selectedId)
   graph.setPositions(loadPositions(pack.packId))
   requestAnimationFrame(() => graph.fit())
   setTimeout(() => graph.fit(), 80)

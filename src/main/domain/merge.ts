@@ -1,5 +1,6 @@
 import type { AttemptRecord, KNode, Mastery, Pack, Question, Relation } from '../../shared/types'
 import { freshMastery } from '../../shared/mastery'
+import { nodesOfAttempt } from './attempt-log'
 
 /**
  * 板块融合。
@@ -27,36 +28,33 @@ export interface MergeResult {
   warnings: string[]
 }
 
-/** 板块的学科标签：优先用 meta，老数据退回 subject 字段 */
 function examOf(p: Pack): string {
   return (p.meta?.exam ?? '').trim()
 }
-function subjectOf(p: Pack): string {
-  return (p.meta?.subject ?? p.subject ?? '').trim()
+export function packSubject(p: Pack): string {
+  return p.scope?.subject?.trim() || p.meta?.subject?.trim() || p.subject?.trim() || ''
 }
 function chapterOf(p: Pack): string {
-  return (p.meta?.chapter ?? p.title ?? '').trim()
+  return p.meta?.chapter?.trim() || p.title.trim()
 }
 
-/** 学科闸门：只有"同考试 + 同科目"才允许融合 */
+/** 学科必须相同，已填写的考试信息须一致。 */
 export function canMerge(packs: Pack[]): { ok: boolean; reason?: string } {
   if (packs.length < 2) return { ok: false, reason: '至少选两个板块' }
   if (packs.length > 4) return { ok: false, reason: '最多一次融合 4 个板块' }
 
-  const missing = packs.filter((p) => !examOf(p) || !subjectOf(p))
-  if (missing.length) {
-    return { ok: false, reason: `「${missing[0].title}」缺少学科信息，无法判断能不能融合` }
+  const missing = packs.find((p) => !packSubject(p))
+  if (missing) {
+    return { ok: false, reason: `「${missing.title}」缺少学科信息，请在「范围与结构」填写学科` }
   }
 
-  const exam = examOf(packs[0])
-  const subject = subjectOf(packs[0])
-  const bad = packs.find((p) => examOf(p) !== exam || subjectOf(p) !== subject)
+  const subject = packSubject(packs[0])
+  const bad = packs.find((p) => packSubject(p) !== subject)
   if (bad) {
-    return {
-      ok: false,
-      reason: `${exam}·${subject} 和 ${examOf(bad)}·${subjectOf(bad)} 不是同一学科，不能融合（会把出题上下文搅在一起）`
-    }
+    return { ok: false, reason: `「${subject}」和「${packSubject(bad)}」不是同一学科，不能融合` }
   }
+  const exams = new Set(packs.map(examOf).filter(Boolean))
+  if (exams.size > 1) return { ok: false, reason: `所选板块属于不同考试（${[...exams].join('、')}），不能融合` }
   return { ok: true }
 }
 
@@ -101,14 +99,13 @@ export function mergeSources(sources: MergeSource[], newTitle: string): MergeRes
     for (const n of src.pack.nodes) {
       const isRoot = n.kind === 'root' || n.parentId === null
       const mapped: KNode = {
+        ...n,
         id: pfx + n.id,
-        name: n.name,
         parentId: n.parentId ? (idMap.get(n.parentId) ?? rootId) : rootId,
         kind: isRoot ? 'concept' : n.kind,
-        examWeight: n.examWeight,
         prereq: [],
         confusable: [],
-        brief: n.brief,
+        scopeIds: undefined,
         origin: n.origin ?? chapter
       }
       if (isRoot) mapped.name = chapter
@@ -152,7 +149,11 @@ export function mergeSources(sources: MergeSource[], newTitle: string): MergeRes
         ...a,
         id: `${pfx}${a.id}`,
         questionId: `${pfx}${a.questionId}`,
-        nodePrimary: np
+        nodePrimary: np,
+        ...(a.tags?.length ? { tags: nodesOfAttempt(a).flatMap((tag) => {
+          const nodeId = remapRef(tag.nodeId)
+          return nodeId ? [{ ...tag, nodeId }] : []
+        }) } : {})
       })
     }
   })
@@ -166,12 +167,12 @@ export function mergeSources(sources: MergeSource[], newTitle: string): MergeRes
   }
 
   const pack: Pack = {
-    packId: `merge-${Date.now().toString(36)}`,
+    packId: `merge-${Date.now().toString(36)}-${Math.random().toString(36).slice(2, 10)}`,
     title,
-    subject: subjectOf(first),
+    subject: packSubject(first),
     totalScore: first.totalScore,
     source: `融合：${sources.map((s) => chapterOf(s.pack)).join(' + ')}`,
-    meta: { exam: examOf(first), subject: subjectOf(first), chapter: title },
+    meta: { exam: sources.map(({ pack }) => examOf(pack)).find(Boolean) ?? '', subject: packSubject(first), chapter: title },
     nodes,
     relations
   }

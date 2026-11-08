@@ -20,7 +20,8 @@ export function todayFromPath(pack: Pack, state: AppState, questions: Question[]
     })
     state.tasks = [...state.tasks.filter((t) => t.date !== date), ...tasks]
   }
-  return state.tasks.filter((t) => t.date === date && t.status !== 'postponed').sort((a, b) => a.sortOrder - b.sortOrder)
+  const active = new Set(pack.nodes.map((node) => node.id))
+  return state.tasks.filter((t) => t.date === date && t.status !== 'postponed' && active.has(t.nodeId)).sort((a, b) => a.sortOrder - b.sortOrder)
 }
 
 export function trackTaskTime(state: AppState, taskId: string | undefined, durationMs: number, date: string): void {

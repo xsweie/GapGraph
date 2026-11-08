@@ -16,12 +16,10 @@ export function scopeItems(lines: string, previous: ScopeItem[], nextId: () => s
 }
 
 export function validateScope(scope: ScopeSpec): void {
-  if (![scope.stage, scope.subject, scope.topic, scope.goal, scope.depth].every((v) => v.trim())) {
-    throw new Error('请补全学段、学科、主题、目标和深度。')
-  }
+  if (!scope.topic.trim()) throw new Error('知识网缺少章节主题。')
   const items = [...scope.include, ...scope.foundations]
-  if (!scope.include.length || new Set(items.map((i) => i.id)).size !== items.length) {
-    throw new Error('请至少纳入一项内容，范围条目须各自独立。')
+  if (new Set(items.map((i) => i.id)).size !== items.length) {
+    throw new Error('范围条目须各自独立。')
   }
 }
 
@@ -33,6 +31,33 @@ export function relationships(nodes: KNode[], previous: Relation[] = []): Relati
     a: id, b: n.id, kind: 'prereq', why: reasons.get(JSON.stringify([id, n.id])) ?? '学习该考点需要此基础'
   })))
   return [...prerequisites, ...confusable]
+}
+
+export function archiveNode(pack: Pack, id: string): Pack {
+  const archived = pack.nodes.find((node) => node.id === id)
+  if (!archived || archived.kind === 'root') throw new Error('请选择要删除的考点。')
+  const nodes = pack.nodes.filter((node) => node.id !== id).map((node) => ({
+    ...node,
+    parentId: node.parentId === id ? archived.parentId : node.parentId,
+    prereq: node.prereq.filter((key) => key !== id),
+    confusable: node.confusable.filter((key) => key !== id)
+  }))
+  return { ...pack, nodes, relations: relationships(nodes, pack.relations) }
+}
+
+/** 直接删除考点时，同步移除只由该考点覆盖的范围条目。 */
+export function archiveNodeWithScope(pack: Pack, id: string): { candidate: Pack; removedItems: ScopeItem[] } {
+  if (pack.nodes.length <= 2) throw new Error('板块至少要保留一个考点。')
+  const candidate = archiveNode(pack, id)
+  const scope = candidate.scope
+  if (!scope) return { candidate, removedItems: [] }
+  const covered = new Set(candidate.nodes.filter((node) => node.kind !== 'root').flatMap((node) => node.scopeIds ?? []))
+  const lost = new Set(pack.nodes.find((node) => node.id === id)?.scopeIds?.filter((key) => !covered.has(key)))
+  const removedItems = [...scope.include, ...scope.foundations].filter((item) => lost.has(item.id))
+  candidate.scope = {
+    ...scope, include: scope.include.filter((item) => !lost.has(item.id)), foundations: scope.foundations.filter((item) => !lost.has(item.id))
+  }
+  return { candidate, removedItems }
 }
 
 /** 旧包保留坏引用供规划诊断。旧关系表里仅有的必要前置并入统一方向。 */
@@ -63,7 +88,7 @@ export function validateGraph(pack: Pack, requireCoverage = true): void {
       throw new Error('前置或易混引用无效：' + n.name)
     }
     if ((n.scopeIds ?? []).some((id) => !ids.has(id))) throw new Error('范围条目引用不存在：' + n.name)
-    if (n.kind !== 'root' && scope && requireCoverage && !n.scopeIds?.length && !n.supplementary) {
+    if (n.kind !== 'root' && scope?.include.length && requireCoverage && !n.scopeIds?.length && !n.supplementary) {
       throw new Error('请为「' + n.name + '」关联范围，或明确标记为补充基础。')
     }
     if (n.kind !== 'root') n.scopeIds?.forEach((id) => covered.add(id))

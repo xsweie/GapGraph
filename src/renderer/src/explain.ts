@@ -4,7 +4,7 @@ import type { DetailedExplain } from './ai'
  * 详细讲解的本地缓存。
  *
  * 按板块 + 考点存：换板块不会串，同一考点重复打开不用重新花钱生成。
- * 生成一次几秒钟、要花 token，所以「有缓存就直接显示，想要新的再点重生成」。
+ * 缓存用于直接展开详细讲解，用户也可以手动重新生成。
  */
 const key = (packId: string): string => `gapgraph.explain.${packId}.v1`
 

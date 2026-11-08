@@ -1,11 +1,11 @@
 import { afterEach, describe, expect, it, vi } from 'vitest'
 import type { AppState, AttemptRecord, KNode, Pack, Question, ScopeSpec } from '../src/shared/types'
 import { DAY, applyAttempt, freshMastery, setSelfLevel } from '../src/shared/mastery'
-import { activeQuestions, restoreEvidenceClocks } from '../src/main/domain/learning-state'
+import { activeQuestions, restoreEvidenceClocks, todayFromPath } from '../src/main/domain/learning-state'
 import { applyDiagAnswer, createDiagnostic, diagnosticCoverage, nextQuestion } from '../src/main/domain/diagnostic'
 import { assessNode, checkpoint, makePath, newEffectiveSince, packRevision } from '../src/main/domain/learning'
 import { buildToday } from '../src/main/domain/queue'
-import { alignGraph, scopedPack } from '../src/main/domain/scope'
+import { alignGraph, archiveNodeWithScope, scopedPack, validateGraph } from '../src/main/domain/scope'
 import { submitAnswer } from '../src/main/domain/submission'
 import { commitStructure, effectivePack, undoStructure } from '../src/renderer/src/edits'
 
@@ -145,6 +145,15 @@ const scope: ScopeSpec = {
 const raw = [node('root', null), { ...node('line', 'root'), scopeIds: ['scope-graph'] }]
 
 describe('范围与结构修订', () => {
+  it('范围留空也能保存知识网，只填写前置时仍检查其覆盖', () => {
+    const optional = { ...scope, stage: '', subject: '', goal: '', depth: '', include: [], exclude: [] }
+    const graph = [raw[0], node('line', 'root'), node('axes', 'root')]
+    expect(scopedPack(optional, graph, 'n').nodes).toHaveLength(3)
+    const withFoundation = { ...optional, foundations: [{ id: 'f1', label: '坐标系' }] }
+    expect(() => scopedPack(withFoundation, graph, 'n')).toThrow('知识网未覆盖：坐标系')
+    expect(scopedPack(withFoundation, [...graph.slice(0, 2), { ...graph[2], scopeIds: ['f1'] }], 'n').nodes).toHaveLength(3)
+  })
+
   it('接受窄范围，拒绝缺覆盖、重复 ID、坏引用和两种环', () => {
     expect(scopedPack(scope, raw, 'n').nodes).toHaveLength(2)
     expect(() => scopedPack(scope, [raw[0], node('line', 'root')], 'n')).toThrow('关联范围')
@@ -178,5 +187,28 @@ describe('范围与结构修订', () => {
     await undoStructure(base.packId, packRevision(saved))
     expect(effectivePack(base).nodes.map((n) => n.id)).toEqual(['root', 'line'])
     expect(storage.getItem('attempt-history')).toBe('old-and-new')
+  })
+
+  it('直接删除考点保留其子节点与历史，清理范围、关系和今日任务', () => {
+    const base = scopedPack({ ...scope, foundations: [{ id: 'f1', label: '基础' }] }, [
+      raw[0], { ...raw[1], scopeIds: ['scope-graph', 'f1'] },
+      { ...node('axes', 'line', ['line']), scopeIds: ['scope-graph'], confusable: ['line'] }
+    ], pack.packId)
+    const { candidate, removedItems } = archiveNodeWithScope(base, 'line')
+    expect(removedItems.map((item) => item.id)).toEqual(['f1'])
+    expect(candidate.nodes.find((item) => item.id === 'axes')).toMatchObject({ parentId: 'root', prereq: [], confusable: [] })
+    expect(candidate.scope?.include).toEqual(scope.include)
+    expect(candidate.relations).toEqual([])
+    expect(() => validateGraph(candidate)).not.toThrow()
+    expect(() => archiveNodeWithScope(candidate, 'axes')).toThrow('至少要保留')
+
+    const data = state()
+    data.attempts = [attempt('old', 'line', true)]
+    data.tasks = [{ id: 'done', date: 'today', kind: 'diagnose', nodeId: 'line', questionIds: ['old'], estMinutes: 4, status: 'done', sortOrder: 0 }]
+    const questions = activeQuestions(candidate, [q('old', 'line'), q('keep', 'axes')])
+    expect(questions.map((item) => item.id)).toEqual(['keep'])
+    expect(todayFromPath(candidate, data, questions, now, 'today').map((task) => task.nodeId)).toEqual(['axes'])
+    expect(data.attempts).toHaveLength(1)
+    expect(data.tasks.find((task) => task.id === 'done')?.status).toBe('done')
   })
 })

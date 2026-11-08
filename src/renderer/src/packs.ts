@@ -1,9 +1,10 @@
 import type { AppState, Pack, Question } from '../../shared/types'
 import { effectivePack } from './edits'
 import { blankMastery } from '../../main/domain/queue'
+import { packSubject } from '../../main/domain/merge'
 import builtin from '../../../resources/packs/gaokao-math-function.json'
 import builtinQuestions from '../../../resources/questions/gaokao-math-function.json'
-import { loadBank, saveBank } from './qbank'
+import { bankKey, loadBank, saveBank } from './qbank'
 
 const CUSTOM_KEY = 'gapgraph.packs.v1'
 const ACTIVE_KEY = 'gapgraph.activepack.v1'
@@ -50,7 +51,8 @@ export function listPacks(): PackEntry[] {
     return {
       id: p.packId, builtin: p.packId === BUILTIN.packId,
       title: rn[p.packId] ?? p.title, chapter: rn[p.packId] ?? p.meta?.chapter ?? p.title,
-      exam: p.meta?.exam ?? '', subject: p.scope?.subject ?? p.subject
+      exam: p.meta?.exam ?? '',
+      subject: packSubject(p)
     }
   })
 }
@@ -109,17 +111,21 @@ export function stateOfPack(pack: Pack): AppState {
 /** 融合结果落盘：板块、题库、学习状态三样一起写 */
 export function saveMergedPack(pack: Pack, questions: Question[], state: AppState): void {
   const all = customPacks()
+  const questionsKey = bankKey(pack.packId)
+  const stateKey = stateKeyFor(pack.packId)
+  if (all[pack.packId] || localStorage.getItem(questionsKey) !== null || localStorage.getItem(stateKey) !== null) {
+    throw new Error('融合板块的编号已存在，请重试。')
+  }
   all[pack.packId] = pack
   try {
+    saveBank(pack.packId, questions)
+    localStorage.setItem(stateKey, JSON.stringify({ ...state, tasks: [] }))
+    // 题库和学习状态落盘后，再让新板块出现在大厅。
     localStorage.setItem(CUSTOM_KEY, JSON.stringify(all))
-  } catch {
-    /* 忽略 */
-  }
-  saveBank(pack.packId, questions)
-  try {
-    localStorage.setItem(stateKeyFor(pack.packId), JSON.stringify({ ...state, tasks: [] }))
-  } catch {
-    /* 忽略 */
+  } catch (error) {
+    localStorage.removeItem(questionsKey)
+    localStorage.removeItem(stateKey)
+    throw error
   }
 }
 

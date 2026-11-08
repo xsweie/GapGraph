@@ -1,7 +1,10 @@
-import { describe, expect, it } from 'vitest'
+import { describe, expect, it, vi } from 'vitest'
 import type { KNode, Mastery, Pack, Question } from '../src/shared/types'
 import { freshMastery } from '../src/shared/mastery'
 import { canMerge, mergeSources, type MergeSource } from '../src/main/domain/merge'
+import { nodesOfAttempt, primaryAttemptNode } from '../src/main/domain/attempt-log'
+import { saveMergedPack, stateKeyFor } from '../src/renderer/src/packs'
+import { bankKey } from '../src/renderer/src/qbank'
 
 const node = (id: string, name: string, parentId: string | null, kind: KNode['kind'] = 'concept'): KNode => ({
   id,
@@ -66,6 +69,16 @@ describe('学科闸门：防止跨学科污染', () => {
     const a = mkPack('p1', '高考', '数学', '函数')
     const b = mkPack('p2', '考研', '数学', '多元函数')
     expect(canMerge([a, b]).ok).toBe(false)
+  })
+
+  it('按学科融合考试留空的新版板块，有明确考试信息时沿用', () => {
+    const a = mkPack('p1', '', ' 数学 ', '函数')
+    const b = mkPack('p2', ' ', '数学', '数列', { meta: { exam: '', subject: '', chapter: '数列' } })
+    const c = mkPack('p3', '高考', '数学', '三角函数')
+    const d = mkPack('p4', '考研', '数学', '极限')
+    expect(canMerge([a, b]).ok).toBe(true)
+    expect(canMerge([a, c, d]).reason).toContain('不同考试')
+    expect(mergeSources([mkSource(b), mkSource(c)], '数学复习').pack.meta).toMatchObject({ exam: '高考', subject: '数学' })
   })
 
   it('只选一个不行，超过四个也不行', () => {
@@ -167,12 +180,17 @@ describe('融合：题库与学习记录', () => {
         correct: false,
         selfConfidence: 'sure',
         guessed: false,
-        errorReason: 'concept'
+        errorReason: 'concept',
+        tags: [{ nodeId: 'a', primary: true, weight: 1 }, { nodeId: 'b', primary: false, weight: 0.4 }]
       }
     ]
     const r = mergeSources([sa, mkSource(b)], '烃类化合物')
     expect(r.attempts).toHaveLength(1)
     expect(r.attempts[0]).toMatchObject({ id: 'm0_att1', questionId: 'm0_q1', nodePrimary: 'm0_a' })
+    expect(nodesOfAttempt(r.attempts[0]).map((tag) => tag.nodeId)).toEqual(['m0_a', 'm0_b'])
+    const legacy = { ...r.attempts[0], nodePrimary: 'm1_m0_a', tags: sa.attempts[0].tags }
+    expect(primaryAttemptNode(legacy)).toBe('m1_m0_a')
+    expect(nodesOfAttempt(legacy).map((tag) => tag.nodeId)).toEqual(['m1_m0_a', 'm1_m0_b'])
   })
 
   it('同名考点会给出提示，但不擅自改名', () => {
@@ -185,4 +203,32 @@ describe('融合：题库与学习记录', () => {
     const math = mkPack('p3', '高考', '数学', '函数')
     expect(() => mergeSources([mkSource(a), mkSource(math)], '乱七八糟')).toThrow(/不是同一学科/)
   })
+})
+
+it('保存融合板块失败时清理半成品，并可重试', () => {
+  const pack = mkPack('merge-test', '', '数学', '复习')
+  const { questions, mastery, attempts } = mkSource(pack)
+  const settings = { dailyMinutes: 40, examDate: '', totalScore: 150, packId: pack.packId }
+  const state = { settings, mastery, attempts, tasks: [] }
+  const registry = 'gapgraph.packs.v1'
+  const initial = JSON.stringify({ source: mkPack('source', '', '数学', '函数') })
+  const data = new Map([[registry, initial]])
+  let full = true
+  vi.stubGlobal('localStorage', {
+    getItem: (key: string) => data.get(key) ?? null,
+    setItem: (key: string, value: string) => {
+      if (full && key === registry) throw new Error('quota')
+      data.set(key, value)
+    },
+    removeItem: (key: string) => data.delete(key)
+  })
+  try {
+    expect(() => saveMergedPack(pack, questions, state)).toThrow('quota')
+    expect([...data]).toEqual([[registry, initial]])
+    full = false
+    saveMergedPack(pack, questions, state)
+    expect(JSON.parse(data.get(registry)!)[pack.packId]).toEqual(pack)
+    expect(JSON.parse(data.get(bankKey(pack.packId))!)).toEqual(questions)
+    expect(JSON.parse(data.get(stateKeyFor(pack.packId))!)).toEqual(state)
+  } finally { vi.unstubAllGlobals() }
 })

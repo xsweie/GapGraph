@@ -1,6 +1,6 @@
 @echo off
 chcp 65001 >nul
-title GapGraph 浏览器版
+title KnowMap 浏览器版
 cd /d "%~dp0"
 
 where npm >nul 2>nul
@@ -17,7 +17,7 @@ if not exist "node_modules" (
 )
 
 echo.
-echo 正在启动 GapGraph（浏览器版）...
+echo 正在启动 KnowMap（浏览器版）...
 echo 启动后浏览器会自动打开 http://localhost:5180
 echo 关闭本窗口即停止服务。
 echo.

@@ -88,6 +88,8 @@ export interface Question {
   /** 判断题：'true' | 'false'；填空题：可接受答案数组 */
   answer: string[] | string
   solution?: string
+  /** 新版代理保存了复核过的完整题干、选项和解析。 */
+  fullText?: true
   /** 1..5 */
   difficulty: number
   tags: Tag[]

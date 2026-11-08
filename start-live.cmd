@@ -1,6 +1,6 @@
 @echo off
 chcp 65001 >nul
-title GapGraph 实时版（含 AI）
+title KnowMap 实时版（含 AI）
 cd /d "%~dp0"
 
 where node >nul 2>nul

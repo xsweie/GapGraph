@@ -32,9 +32,10 @@ export function nextQuestion(
   if (state.askedIds.length >= DIAG_TARGET || diagnosticCoverage(state, nodes).ready) return null
 
   const byId = new Map(nodes.map((n) => [n.id, n]))
-  const covered = new Set(state.answered.filter((a) => !a.guessed).map((a) => a.nodeId))
+  const activeAnswers = state.answered.filter((a) => byId.has(a.nodeId))
+  const covered = new Set(activeAnswers.filter((a) => !a.guessed).map((a) => a.nodeId))
   const branches = new Set([...covered].map((id) => primaryBranch(id, nodes)))
-  const lastWrong = [...state.answered].reverse().find((a) => !a.correct)
+  const lastWrong = [...activeAnswers].reverse().find((a) => !a.correct)
   const drill = new Set(lastWrong ? (byId.get(lastWrong.nodeId)?.prereq ?? []) : [])
 
   let best: { q: Question; score: number } | null = null
@@ -57,6 +58,23 @@ export function nextQuestion(
     if (!best || score > best.score) best = { q, score }
   }
   return best?.q ?? null
+}
+
+/** 缺题时每个主分支选一个考点，允许从未测过的深层考点准备新题。 */
+export function diagnosticTargets(state: DiagState, questions: Question[], nodes: KNode[]): KNode[] {
+  const tested = new Set(state.answered.filter((answer) => !answer.guessed).map((answer) => answer.nodeId))
+  const covered = new Set([...tested].map((id) => primaryBranch(id, nodes)))
+  const withQuestions = new Set(questions.map(primaryNodeOf))
+  const priority = (node: KNode): number => Number(!tested.has(node.id)) * 2 + Number(!withQuestions.has(node.id))
+  const targets = new Map<string, KNode>()
+  for (const node of nodes) {
+    const branch = primaryBranch(node.id, nodes)
+    if (!branch) continue
+    const previous = targets.get(branch)
+    if (!previous || priority(node) > priority(previous)) targets.set(branch, node)
+  }
+  return [...targets].sort(([a], [b]) => Number(covered.has(a)) - Number(covered.has(b)))
+    .slice(0, 3).map(([, node]) => node)
 }
 
 export function applyDiagAnswer(
@@ -103,7 +121,8 @@ export function summarize(
   mastery: Record<string, Mastery>,
   now: number
 ): DiagSummary {
-  const touchedIds = [...new Set(state.answered.filter((a) => !a.guessed).map((a) => a.nodeId))]
+  const active = new Map(nodes.map((node) => [node.id, node.name]))
+  const touchedIds = [...new Set(state.answered.filter((a) => !a.guessed && active.has(a.nodeId)).map((a) => a.nodeId))]
   const bands = { red: 0, orange: 0, yellow: 0, green: 0, self: 0 }
   const scored: { id: string; name: string; score: number }[] = []
 
@@ -114,7 +133,7 @@ export function summarize(
     // 摸完底的节点都答过题，理论上不会落在这两档；保险起见跳过而不是崩掉
     if (b === 'unmeasured' || b === 'self') continue
     bands[b] += 1
-    scored.push({ id, name: nodes.find((n) => n.id === id)?.name ?? id, score: masteryScore(m, now) })
+    scored.push({ id, name: active.get(id)!, score: masteryScore(m, now) })
   }
 
   scored.sort((a, b) => a.score - b.score)

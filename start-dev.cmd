@@ -1,6 +1,6 @@
 @echo off
 chcp 65001 >nul
-title GapGraph 开发模式
+title KnowMap 开发模式
 cd /d "%~dp0"
 
 where npm.cmd >nul 2>nul
@@ -25,7 +25,7 @@ if not exist "node_modules\electron\dist\electron.exe" (
 )
 
 echo.
-echo 正在启动 GapGraph ... 关闭本窗口即停止。
+echo 正在启动 KnowMap ... 关闭本窗口即停止。
 echo.
 call npm.cmd run dev
 

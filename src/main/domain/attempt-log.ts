@@ -50,8 +50,15 @@ export function buildAttemptRecord(input: {
  * 老记录没有 tags 字段，退回"只有主节点"，行为与升级前一致。
  */
 export function nodesOfAttempt(a: AttemptRecord): AttemptTag[] {
-  if (Array.isArray(a.tags) && a.tags.length) return a.tags
-  return [{ nodeId: a.nodePrimary, weight: 1, primary: true }]
+  if (!Array.isArray(a.tags) || !a.tags.length) return [{ nodeId: a.nodePrimary, weight: 1, primary: true }]
+
+  // 旧融合记录只给主考点字段加了前缀，使用该前缀对齐旧标签。
+  const primary = a.tags.find((tag) => tag.primary)?.nodeId
+  if (primary && a.nodePrimary.endsWith(primary)) {
+    const prefix = a.nodePrimary.slice(0, -primary.length)
+    if (/^(?:m\d+_)+$/.test(prefix)) return a.tags.map((tag) => ({ ...tag, nodeId: prefix + tag.nodeId }))
+  }
+  return a.tags
 }
 
 export function primaryAttemptNode(a: AttemptRecord): string | undefined {

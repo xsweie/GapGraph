@@ -1,5 +1,6 @@
 /** 实时 AI：通过本地代理调用（浏览器版受 CORS 限制，必须走代理；Electron 同样可以走） */
 import type { KNode, ScopeSpec } from '../../shared/types'
+import type { NewQuestion } from './qbank'
 
 const KEY = 'gapgraph.ai.endpoint'
 
@@ -7,6 +8,8 @@ const KEY = 'gapgraph.ai.endpoint'
 let resolved = ''
 let reachable = false
 let routes: string[] = []
+let capabilities: string[] = []
+let proxyVersion = ''
 let probed = false
 
 function readStored(): string {
@@ -35,11 +38,13 @@ export async function initEndpoint(): Promise<void> {
     try {
       const res = await fetch(`${ep}/health`, { signal: AbortSignal.timeout(2000) })
       if (!res.ok) continue
-      const j = (await res.json()) as { ok?: boolean; routes?: string[] }
+      const j = (await res.json()) as { ok?: boolean; version?: string; routes?: string[]; capabilities?: string[] }
       if (j?.ok) {
         resolved = ep
         reachable = true
         routes = Array.isArray(j.routes) ? j.routes : []
+        capabilities = Array.isArray(j.capabilities) ? j.capabilities : []
+        proxyVersion = typeof j.version === 'string' ? j.version : ''
         return
       }
     } catch {
@@ -49,6 +54,8 @@ export async function initEndpoint(): Promise<void> {
   resolved = stored // 填过地址但连不上，也让界面能显示"连不上哪个"
   reachable = false
   routes = []
+  capabilities = []
+  proxyVersion = ''
 }
 
 export function getEndpoint(): string {
@@ -62,6 +69,8 @@ export function endpointStatus(): {
   reachable: boolean
   supportsPack: boolean
   supportsScope: boolean
+  supportsOptionalScope: boolean
+  proxyVersion: string
   supportsChat: boolean
   supportsQuestions: boolean
   supportsExplain: boolean
@@ -71,19 +80,12 @@ export function endpointStatus(): {
     reachable,
     supportsPack: routes.includes('pack'),
     supportsScope: routes.includes('scope'),
+    supportsOptionalScope: routes.includes('pack') && capabilities.includes('optional-scope'),
+    proxyVersion,
     supportsChat: routes.includes('chat'),
-    supportsQuestions: routes.includes('questions'),
+    supportsQuestions: routes.includes('questions') && capabilities.includes('full-question-text'),
     supportsExplain: routes.includes('explain')
   }
-}
-
-export interface NewQuestionPayload {
-  type: 'single' | 'blank' | 'judge'
-  difficulty: number
-  stem: string
-  options?: string[]
-  answer: string
-  solution: string
 }
 
 /**
@@ -95,7 +97,7 @@ export async function generateQuestions(
   need: number,
   difficulties: number[],
   ctx?: { exam?: string; subject?: string; chapter?: string; scope?: ScopeSpec }
-): Promise<NewQuestionPayload[]> {
+): Promise<NewQuestion[]> {
   const endpoint = getEndpoint()
   if (!endpoint) return []
 
@@ -119,8 +121,8 @@ export async function generateQuestions(
     const detail = await res.text().catch(() => '')
     throw new Error(`出题失败 ${res.status} ${detail.slice(0, 100)}`)
   }
-  const data = (await res.json()) as { questions?: NewQuestionPayload[] }
-  return Array.isArray(data.questions) ? data.questions : []
+  const data = (await res.json()) as { questions?: NewQuestion[] }
+  return Array.isArray(data.questions) ? data.questions.filter((q) => q?.fullText === true) : []
 }
 
 export function setEndpoint(value: string): void {
@@ -165,7 +167,7 @@ export interface GeneratedPack {
   tokens: number
 }
 
-/** 让 AI 现场拆一张考纲骨架。没配代理时返回 null。 */
+/** 按学习描述和可选范围生成知识网。 */
 export async function generatePack(input: { scope: ScopeSpec; request?: string; current?: KNode[] }): Promise<GeneratedPack> {
   const current = input.current?.map(({ id, name, parentId, kind, prereq, scopeIds, supplementary, examWeight, weightLocked, edited }) =>
     ({ id, name, parentId, kind, prereq, scopeIds, supplementary, examWeight, weightLocked, edited }))
@@ -188,9 +190,12 @@ export function draftScope(request: string, scope?: ScopeSpec): Promise<ScopeDra
   return scopeRequest('/scope', { request, scope })
 }
 
-async function scopeRequest<T>(route: string, input: object): Promise<T> {
+async function scopeRequest<T>(route: '/scope' | '/pack', input: object): Promise<T> {
+  const supportsRoute = () => route === '/pack' ? endpointStatus().supportsOptionalScope : endpointStatus().supportsScope
+  if (!supportsRoute()) await initEndpoint()
   const endpoint = getEndpoint()
-  if (!endpoint || !endpointStatus().supportsScope) throw new Error('AI 代理离线或版本过旧，重启新版代理后重试。')
+  if (!endpointStatus().reachable) throw new Error('AI 代理离线，请运行 start.bat 后重试。')
+  if (!supportsRoute()) throw new Error('AI 代理版本过旧，请关闭旧启动窗口并重新运行 start.bat。')
 
   const ctrl = new AbortController()
   const timer = setTimeout(() => ctrl.abort(), 60000)

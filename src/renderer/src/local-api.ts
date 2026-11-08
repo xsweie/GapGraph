@@ -12,7 +12,7 @@ import { isCorrect } from '../../main/domain/grading'
 import { activeQuestions, applyLearningUpdate, restoreEvidenceClocks, todayFromPath } from '../../main/domain/learning-state'
 import { submitAnswer } from '../../main/domain/submission'
 import { builtinPack, currentPack, stateKeyFor } from './packs'
-import { loadBank } from './qbank'
+import { loadPlayableBank } from './qbank'
 import { effectivePack } from './edits'
 
 /** 当前生效的考纲：由引导流程选定，换了章节就换这一份；状态按 packId 隔离 */
@@ -24,7 +24,7 @@ const BUILTIN_ID = (packJson as unknown as Pack).packId
 const BUILTIN_QUESTIONS: Question[] = [
   ...(PACK.packId === BUILTIN_ID ? (questionsJson as unknown as { questions: Question[] }).questions : [])
 ]
-const currentQuestions = () => activeQuestions(PACK, [...BUILTIN_QUESTIONS, ...loadBank(PACK.packId)])
+const currentQuestions = () => activeQuestions(PACK, [...BUILTIN_QUESTIONS, ...loadPlayableBank(PACK.packId)])
 const KEY = stateKeyFor(PACK.packId)
 
 function todayKey(now: number): string {
