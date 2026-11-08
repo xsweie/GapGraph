@@ -5,25 +5,26 @@
  */
 import packJson from '../../../resources/packs/gaokao-math-function.json'
 import questionsJson from '../../../resources/questions/gaokao-math-function.json'
-import type { AppState, LoadResult, Mastery, Pack, Question, SubmitPayload, SubmitResult, Task } from '../../shared/types'
-import { applyAttempt, band, effective, freshMastery, masteryScore, migrateMastery, setSelfLevel } from '../../shared/mastery'
-import { blankMastery, buildToday, coverage, daysUntil } from '../../main/domain/queue'
+import type { AppState, LearningUpdate, LoadResult, Pack, Question, SubmitPayload, SubmitResult, Task } from '../../shared/types'
+import { effective, freshMastery, migrateMastery, setSelfLevel } from '../../shared/mastery'
+import { blankMastery, coverage, daysUntil } from '../../main/domain/queue'
 import { isCorrect } from '../../main/domain/grading'
-import { buildAttemptRecord } from '../../main/domain/attempt-log'
+import { activeQuestions, applyLearningUpdate, restoreEvidenceClocks, todayFromPath } from '../../main/domain/learning-state'
+import { submitAnswer } from '../../main/domain/submission'
 import { builtinPack, currentPack, stateKeyFor } from './packs'
 import { loadBank } from './qbank'
-import { applyEdits, loadEdits } from './edits'
+import { effectivePack } from './edits'
 
 /** 当前生效的考纲：由引导流程选定，换了章节就换这一份；状态按 packId 隔离 */
 const RAW_PACK: Pack = currentPack() ?? builtinPack()
 /** 用户增删过的考点在这里套上去 */
-const PACK: Pack = applyEdits(RAW_PACK, loadEdits(RAW_PACK.packId))
+const PACK: Pack = effectivePack(RAW_PACK)
 const BUILTIN_ID = (packJson as unknown as Pack).packId
 /** 内置题库 + 按需生成后缓存下来的题 */
-const QUESTIONS: Question[] = [
-  ...(PACK.packId === BUILTIN_ID ? (questionsJson as unknown as { questions: Question[] }).questions : []),
-  ...loadBank(PACK.packId)
+const BUILTIN_QUESTIONS: Question[] = [
+  ...(PACK.packId === BUILTIN_ID ? (questionsJson as unknown as { questions: Question[] }).questions : [])
 ]
+const currentQuestions = () => activeQuestions(PACK, [...BUILTIN_QUESTIONS, ...loadBank(PACK.packId)])
 const KEY = stateKeyFor(PACK.packId)
 
 function todayKey(now: number): string {
@@ -33,7 +34,7 @@ function todayKey(now: number): string {
 
 function defaultState(): AppState {
   return {
-    settings: { dailyMinutes: 40, examDate: '2027-06-07', totalScore: PACK.totalScore, packId: PACK.packId },
+    settings: { dailyMinutes: 40, examDate: '', totalScore: PACK.totalScore, packId: PACK.packId },
     mastery: blankMastery(PACK.nodes),
     attempts: [],
     tasks: []
@@ -68,6 +69,7 @@ function read(): AppState {
     }
     // v1 → v2：把自评/能力/保持/可信度拆开。幂等，重复执行不改任何数。
     for (const id of Object.keys(s.mastery)) s.mastery[id] = migrateMastery(s.mastery[id])
+    restoreEvidenceClocks(s)
     s.schemaVersion = 2
     return s
   } catch {
@@ -93,26 +95,11 @@ function daysLeft(s: AppState, now: number): number {
   return daysUntil(s.settings.examDate, now)
 }
 
-function buildQueue(s: AppState, now: number): Task[] {
-  return buildToday({
-    nodes: PACK.nodes,
-    questions: QUESTIONS,
-    mastery: s.mastery,
-    now,
-    dailyMinutes: s.settings.dailyMinutes,
-    daysLeft: daysLeft(s, now),
-    date: todayKey(now)
-  })
-}
-
-function ensureToday(s: AppState, now: number): Task[] {
-  const key = todayKey(now)
-  const existing = s.tasks.filter((t) => t.date === key)
-  if (existing.length) return existing.sort((a, b) => a.sortOrder - b.sortOrder)
-  const tasks = buildQueue(s, now)
-  s.tasks = [...s.tasks.filter((t) => t.date !== key), ...tasks]
-  write(s)
-  return tasks
+function ensureToday(s: AppState, now: number, reason?: string, stepId?: string): Task[] {
+  const before = s.path
+  const today = todayFromPath(PACK, s, currentQuestions(), now, todayKey(now), reason, stepId)
+  if (before !== s.path) write(s)
+  return today
 }
 
 function overviewOf(s: AppState, now: number) {
@@ -136,75 +123,25 @@ export function createLocalApi() {
     async load(): Promise<LoadResult & { overview: ReturnType<typeof overviewOf> }> {
       const now = Date.now()
       const state = read()
-      return { pack: PACK, questions: QUESTIONS, state, today: ensureToday(state, now), overview: overviewOf(state, now) }
+      return { pack: PACK, questions: currentQuestions(), state, today: ensureToday(state, now), overview: overviewOf(state, now) }
     },
 
     async submit(payload: SubmitPayload): Promise<SubmitResult & { today: Task[]; overview: ReturnType<typeof overviewOf> }> {
       const now = Date.now()
       const state = read()
-      const q = QUESTIONS.find((x) => x.id === payload.questionId)
-      if (!q) throw new Error('题目不存在')
-
-      const correct = isCorrect(q, payload.answer)
-      const guessed = correct && payload.durationMs < 3000 && q.difficulty >= 3
-      const primary = q.tags.find((t) => t.primary) ?? q.tags[0]
-      const mBefore = state.mastery[primary.nodeId] ?? freshMastery(0)
-      const before = masteryScore(mBefore, now)
-      const beforeBand = band(mBefore, now)
-
-      for (const tag of q.tags) {
-        const m: Mastery = state.mastery[tag.nodeId] ?? freshMastery(0)
-        const weight = tag.primary || correct ? tag.weight : tag.weight * 0.3
-        state.mastery[tag.nodeId] = applyAttempt(m, {
-          difficulty: q.difficulty,
-          correct,
-          weight,
-          sure: payload.selfConfidence === 'sure',
-          guessed,
-          now,
-          errorReason: correct ? null : payload.errorReason
-        })
-      }
-
-      state.attempts.push(
-        buildAttemptRecord({
-          id: `a_${now}_${Math.random().toString(36).slice(2, 8)}`,
-          question: q,
-          primaryNodeId: primary.nodeId,
-          correct,
-          guessed,
-          durationMs: payload.durationMs,
-          now,
-          selfConfidence: payload.selfConfidence,
-          errorReason: payload.errorReason
-        })
-      )
-
-      const task = state.tasks.find((t) => t.status === 'pending' && t.questionIds.includes(q.id))
-      if (task && correct) task.status = 'done'
-
+      const result = submitAnswer(state, currentQuestions(), payload, now, todayKey(now))
       write(state)
-      return {
-        correct,
-        nodeId: primary.nodeId,
-        before,
-        after: masteryScore(state.mastery[primary.nodeId], now),
-        beforeBand,
-        afterBand: band(state.mastery[primary.nodeId], now),
-        guessed,
-        solution: q.solution,
-        state,
-        today: ensureToday(state, now),
-        overview: overviewOf(state, now)
-      }
+      return { ...result, today: ensureToday(state, now), overview: overviewOf(state, now) }
     },
 
     async completeTask(taskId: string) {
       const state = read()
       const t = state.tasks.find((x) => x.id === taskId)
+      const now = Date.now()
       if (t) t.status = 'done'
+      const today = ensureToday(state, now, '完成今日任务后检查路径', t?.stepId)
       write(state)
-      return { state, today: ensureToday(state, Date.now()), overview: overviewOf(state, Date.now()) }
+      return { state, today, overview: overviewOf(state, now) }
     },
 
     async postponeTask(taskId: string) {
@@ -215,14 +152,18 @@ export function createLocalApi() {
       return { state, today: ensureToday(state, Date.now()), overview: overviewOf(state, Date.now()) }
     },
 
-    async rebuildQueue() {
-      const now = Date.now()
+    async learning(update: LearningUpdate) {
       const state = read()
-      const key = todayKey(now)
-      const tasks = buildQueue(state, now)
-      state.tasks = [...state.tasks.filter((t) => t.date !== key), ...tasks]
+      applyLearningUpdate(state, update)
+      const now = Date.now()
+      const today = ensureToday(state, now, update.kind === 'checkpoint' ? update.reason : undefined,
+        update.kind === 'checkpoint' ? update.completedStep : undefined)
       write(state)
-      return { today: tasks, overview: overviewOf(state, now) }
+      return { state, today, overview: overviewOf(state, now) }
+    },
+
+    async rebuildQueue() {
+      return this.learning({ kind: 'checkpoint', reason: '手动重新规划' })
     },
 
     async rate(nodeId: string, level: 0 | 1 | 2) {
@@ -237,7 +178,7 @@ export function createLocalApi() {
     },
 
     async check(questionId: string, answer: string) {
-      const q = QUESTIONS.find((x) => x.id === questionId)
+      const q = currentQuestions().find((x) => x.id === questionId)
       if (!q) throw new Error('题目不存在')
       return { correct: isCorrect(q, answer) }
     },
@@ -256,12 +197,7 @@ export function createLocalApi() {
       }
       write(state)
       const now = Date.now()
-      const key = todayKey(now)
-      state.tasks = state.tasks.filter((t) => t.date !== key)
-      const today = buildQueue(state, now)
-      state.tasks = [...state.tasks, ...today]
-      write(state)
-      return { state, today, overview: overviewOf(state, now) }
+      return { state, today: ensureToday(state, now, '更新今日时间预算'), overview: overviewOf(state, now) }
     }
   }
 }

@@ -1,4 +1,5 @@
 /** 实时 AI：通过本地代理调用（浏览器版受 CORS 限制，必须走代理；Electron 同样可以走） */
+import type { KNode, ScopeSpec } from '../../shared/types'
 
 const KEY = 'gapgraph.ai.endpoint'
 
@@ -19,7 +20,7 @@ function readStored(): string {
 /**
  * 启动时探测一次：
  * 1) 设置里填了地址 → 用它
- * 2) 没填但页面是 http 打开的 → 试同源（代理托管页面的场景）
+ * 2) 页面是 http 打开的 → 在没有可用设置时试同源
  * 3) 探测 /health 不通就认定"没有 AI 服务"
  *
  * 之前少了这一步，Vite dev（5180）会被误当成 AI 服务，请求 /pack 直接 404。
@@ -28,7 +29,7 @@ export async function initEndpoint(): Promise<void> {
   probed = true
   const stored = readStored()
   const origin = /^https?:\/\//.test(location.origin) ? location.origin : ''
-  const candidates = stored ? [stored] : origin ? [origin] : []
+  const candidates = new Set([stored, origin].filter(Boolean))
 
   for (const ep of candidates) {
     try {
@@ -60,6 +61,7 @@ export function endpointStatus(): {
   endpoint: string
   reachable: boolean
   supportsPack: boolean
+  supportsScope: boolean
   supportsChat: boolean
   supportsQuestions: boolean
   supportsExplain: boolean
@@ -68,6 +70,7 @@ export function endpointStatus(): {
     endpoint: getEndpoint(),
     reachable,
     supportsPack: routes.includes('pack'),
+    supportsScope: routes.includes('scope'),
     supportsChat: routes.includes('chat'),
     supportsQuestions: routes.includes('questions'),
     supportsExplain: routes.includes('explain')
@@ -91,7 +94,7 @@ export async function generateQuestions(
   node: { name: string; brief?: string; examWeight: number },
   need: number,
   difficulties: number[],
-  ctx?: { exam?: string; subject?: string; chapter?: string }
+  ctx?: { exam?: string; subject?: string; chapter?: string; scope?: ScopeSpec }
 ): Promise<NewQuestionPayload[]> {
   const endpoint = getEndpoint()
   if (!endpoint) return []
@@ -107,7 +110,8 @@ export async function generateQuestions(
       difficulties: difficulties.slice(0, need),
       exam: ctx?.exam ?? '',
       subject: ctx?.subject ?? '',
-      chapter: ctx?.chapter ?? ''
+      chapter: ctx?.chapter ?? '',
+      scope: ctx?.scope
     }),
     signal: AbortSignal.timeout(60000)
   })
@@ -130,6 +134,8 @@ export function setEndpoint(value: string): void {
 }
 
 export interface AskPayload {
+  scope?: ScopeSpec
+  subject?: string
   nodeName: string
   nodePath: string
   explain: string
@@ -160,18 +166,36 @@ export interface GeneratedPack {
 }
 
 /** 让 AI 现场拆一张考纲骨架。没配代理时返回 null。 */
-export async function generatePack(input: {
-  exam: string
-  subject: string
-  chapter: string
-}): Promise<GeneratedPack | null> {
+export async function generatePack(input: { scope: ScopeSpec; request?: string; current?: KNode[] }): Promise<GeneratedPack> {
+  const current = input.current?.map(({ id, name, parentId, kind, prereq, scopeIds, supplementary, examWeight, weightLocked, edited }) =>
+    ({ id, name, parentId, kind, prereq, scopeIds, supplementary, examWeight, weightLocked, edited }))
+  return scopeRequest('/pack', { ...input, current })
+}
+
+export interface ScopeDraft {
+  stage?: string
+  subject?: string
+  topic?: string
+  goal?: string
+  depth?: string
+  include?: string[]
+  exclude?: string[]
+  foundations?: string[]
+  question?: string
+}
+
+export function draftScope(request: string, scope?: ScopeSpec): Promise<ScopeDraft> {
+  return scopeRequest('/scope', { request, scope })
+}
+
+async function scopeRequest<T>(route: string, input: object): Promise<T> {
   const endpoint = getEndpoint()
-  if (!endpoint) return null
+  if (!endpoint || !endpointStatus().supportsScope) throw new Error('AI 代理离线或版本过旧，重启新版代理后重试。')
 
   const ctrl = new AbortController()
   const timer = setTimeout(() => ctrl.abort(), 60000)
   try {
-    const res = await fetch(`${endpoint}/pack`, {
+    const res = await fetch(`${endpoint}${route}`, {
       method: 'POST',
       headers: { 'content-type': 'application/json' },
       body: JSON.stringify(input),
@@ -181,7 +205,7 @@ export async function generatePack(input: {
       const detail = await res.text().catch(() => '')
       throw new Error(`生成失败 ${res.status} ${detail.slice(0, 100)}`)
     }
-    return (await res.json()) as GeneratedPack
+    return (await res.json()) as T
   } finally {
     clearTimeout(timer)
   }
@@ -215,6 +239,7 @@ export async function askAi(payload: AskPayload): Promise<AiAnswer | null> {
 /* ---------------- 详细讲解 ---------------- */
 
 export interface ExplainPayload {
+  scope?: ScopeSpec
   nodeName: string
   nodePath: string
   brief: string

@@ -97,6 +97,8 @@ export class KnowledgeGraph {
   private mastery: Record<string, Mastery> = {}
   private now = Date.now()
   private selected: string | null = null
+  private focusIds = new Set<string>()
+  private focusVisible = new Set<string>()
   private mode: GraphMode = 'structure'
   private fold = false
   private handlers: GraphHandlers
@@ -126,7 +128,7 @@ export class KnowledgeGraph {
     this.gNode = el('g')
     const defs = el('defs')
     defs.innerHTML =
-      '<marker id="arw" viewBox="0 0 10 10" refX="8.5" refY="5" markerWidth="6.5" markerHeight="6.5" orient="auto-start-reverse"><path d="M0,0.5 L9,5 L0,9.5 z" fill="#5b6472"/></marker>'
+      '<marker id="arw" viewBox="0 0 10 10" refX="8.5" refY="5" markerWidth="6.5" markerHeight="6.5" orient="auto-start-reverse"><path d="M0,0.5 L9,5 L0,9.5 z" fill="var(--pre)"/></marker>'
     this.svg.append(defs, this.cam)
     this.cam.append(this.gEdge, this.gNode)
 
@@ -146,9 +148,13 @@ export class KnowledgeGraph {
   /* ---------------- 数据 ---------------- */
 
   setData(nodes: KNode[], mastery: Record<string, Mastery>, now = Date.now(), relations: Relation[] = []): void {
-    this.nodes = nodes
     this.mastery = mastery
     this.now = now
+    if (this.nodes === nodes) {
+      this.render()
+      return
+    }
+    this.nodes = nodes
     this.resizeCanvas(nodes.length)
     this.edges = this.buildEdges(nodes, relations)
     this.measure()
@@ -170,7 +176,7 @@ export class KnowledgeGraph {
     for (const n of nodes) if (n.parentId && ids.has(n.parentId)) out.push({ a: n.parentId, b: n.id, kind: 'tree' })
     for (const r of relations) {
       if (!ids.has(r.a) || !ids.has(r.b)) continue
-      const key = `${r.kind}:${[r.a, r.b].sort().join('|')}`
+      const key = `${r.kind}:${(r.kind === 'prereq' ? [r.a, r.b] : [r.a, r.b].sort()).join('|')}`
       if (seen.has(key)) continue
       seen.add(key)
       out.push({ a: r.a, b: r.b, kind: r.kind === 'prereq' ? 'pre' : 'con', why: r.why })
@@ -194,7 +200,7 @@ export class KnowledgeGraph {
 
   private visibleNodes(): KNode[] {
     if (!this.fold) return this.nodes
-    return this.nodes.filter((n) => n.kind === 'root' || this.depthOf(n.id) <= 2)
+    return this.nodes.filter((n) => n.kind === 'root' || this.depthOf(n.id) <= 2 || this.focusVisible.has(n.id))
   }
 
   /** 量出"圆点 + 文字"的整体碰撞箱 */
@@ -405,9 +411,11 @@ export class KnowledgeGraph {
       if (b) {
         // 松手：解除硬钉，换成软锚——它会留在你放的地方，但邻居还能挤动它
         b.pinned = false
-        b.anchor = { x: b.x - b.dx, y: b.y }
-        this.handlers.onMoveNode?.(id, Math.round(b.x - b.dx), Math.round(b.y))
-        this.startSim()
+        if (moved >= 4) {
+          b.anchor = { x: b.x - b.dx, y: b.y }
+          this.handlers.onMoveNode?.(id, Math.round(b.x - b.dx), Math.round(b.y))
+          this.startSim()
+        }
       }
       // 按下去又松开、几乎没移动 = 点选（不是拖），选中它才看得到前置/易混
       if (moved < 4) this.handlers.onSelect(id)
@@ -514,8 +522,8 @@ export class KnowledgeGraph {
     this.applyCam()
   }
 
-  fit(): void {
-    const vis = this.listOfVisible()
+  fit(ids?: ReadonlySet<string>): void {
+    const vis = this.listOfVisible().filter((box) => !ids || ids.has(box.id))
     if (!vis.length) return
     const r = this.svg.getBoundingClientRect()
     const pad = 44
@@ -530,7 +538,7 @@ export class KnowledgeGraph {
       maxY = Math.max(maxY, b.y + b.h / 2)
     }
     const raw = Math.min((r.width - pad * 2) / (maxX - minX), (r.height - pad * 2) / (maxY - minY))
-    this.k = Math.max(0.62, Math.min(1.6, raw))
+    this.k = Math.max(ids ? 0.2 : 0.62, Math.min(1.6, raw))
     this.tx = r.width / 2 - ((minX + maxX) / 2) * this.k
     this.ty = r.height / 2 - ((minY + maxY) / 2) * this.k
     this.applyCam()
@@ -545,6 +553,24 @@ export class KnowledgeGraph {
     this.applyDim()
   }
 
+  setFocus(ids: ReadonlySet<string>): void {
+    const byId = new Map(this.nodes.map((node) => [node.id, node]))
+    const valid = new Set([...ids].filter((id) => byId.has(id)))
+    if (valid.size === this.focusIds.size && [...valid].every((id) => this.focusIds.has(id))) return
+    this.focusIds = valid
+    this.svg.dataset.focus = valid.size ? 'plan' : ''
+    this.focusVisible = new Set()
+    for (const id of valid) {
+      let node = byId.get(id)
+      while (node && !this.focusVisible.has(node.id)) {
+        this.focusVisible.add(node.id)
+        node = node.parentId ? byId.get(node.parentId) : undefined
+      }
+    }
+    if (this.fold) this.render()
+    else this.applyDim()
+  }
+
   setMode(mode: GraphMode): void {
     this.mode = mode
     this.svg.dataset.mode = mode
@@ -553,8 +579,6 @@ export class KnowledgeGraph {
 
   setFold(fold: boolean): void {
     this.fold = fold
-    this.measure()
-    this.layout(220)
     this.render()
   }
 
@@ -664,7 +688,7 @@ export class KnowledgeGraph {
           fill: 'transparent'
         })
       )
-      g.append(el('circle', { class: 'dot', r: b.r, fill }))
+      g.append(el('circle', { class: 'dot', r: b.r, fill }), el('circle', { class: 'plan-ring', r: b.r + 4 }))
       const t = el('text', { x: b.r + LABEL_GAP, y: 0, 'font-size': LABEL_FONT, 'font-weight': n.kind === 'root' ? 700 : 500 })
       t.textContent = b.label
       g.append(t)
@@ -697,15 +721,20 @@ export class KnowledgeGraph {
 
   private applyDim(): void {
     const focus = this.selected
+    const planning = this.focusIds.size > 0
     this.gEdge.querySelectorAll('.edge').forEach((e) => {
-      const on = !!focus && (e.getAttribute('data-a') === focus || e.getAttribute('data-b') === focus)
+      const a = e.getAttribute('data-a') ?? ''
+      const b = e.getAttribute('data-b') ?? ''
+      const within = planning && this.focusIds.has(a) && this.focusIds.has(b)
+      const on = !planning && !!focus && (a === focus || b === focus)
       e.classList.toggle('ctx', on)
-      e.classList.toggle('dim', !!focus && !on)
+      e.classList.toggle('plan-edge', within)
+      e.classList.toggle('dim', planning ? !within : !!focus && !on)
     })
     this.gNode.querySelectorAll('.node').forEach((n) => {
       const id = n.getAttribute('data-id') ?? ''
-      let dim = !!focus && id !== focus
-      if (!focus && this.mode === 'gap') {
+      let dim = planning ? !this.focusIds.has(id) : !!focus && id !== focus
+      if (!planning && !focus && this.mode === 'gap') {
         const m = this.mastery[id]
         const weak = !m || m.n === 0 || masteryScore(m, this.now) < 0.4
         dim = !weak

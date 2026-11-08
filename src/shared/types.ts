@@ -10,6 +10,21 @@ export type NodeKind = 'concept' | 'skill' | 'root'
  */
 export type WeightSource = 'ai' | 'manual' | 'stats'
 
+export interface ScopeItem { id: string; label: string }
+
+export interface ScopeSpec {
+  version: number
+  source: 'confirmed' | 'legacy'
+  stage: string
+  subject: string
+  topic: string
+  goal: string
+  depth: string
+  include: ScopeItem[]
+  exclude: string[]
+  foundations: ScopeItem[]
+}
+
 export interface KNode {
   id: string
   name: string
@@ -19,6 +34,10 @@ export interface KNode {
   examWeight: number
   /** examWeight 的来源，缺省按 'ai' 处理 */
   weightSource?: WeightSource
+  weightLocked?: boolean
+  edited?: boolean
+  scopeIds?: string[]
+  supplementary?: boolean
   /** 前置考点：不会它，本篇学不动 */
   prereq: string[]
   /** 容易混淆的考点（对称） */
@@ -48,6 +67,8 @@ export interface Pack {
   meta?: { exam: string; subject: string; chapter: string }
   nodes: KNode[]
   relations?: Relation[]
+  scope?: ScopeSpec
+  revision?: string
 }
 
 export type QuestionType = 'single' | 'blank' | 'judge'
@@ -144,6 +165,45 @@ export interface Task {
   estMinutes: number
   status: 'pending' | 'done' | 'postponed'
   sortOrder: number
+  stepId?: string
+  spentMinutes?: number
+}
+
+export interface DiagnosticRound {
+  askedIds: string[]
+  answered: { questionId: string; nodeId: string; correct: boolean; guessed?: boolean }[]
+  targetDifficulty: number
+  finished?: boolean
+  revision?: string
+}
+
+export interface LearningSignal {
+  nodeId: string
+  at: number
+  kind: 'question' | 'explain' | 'card' | 'confusion'
+  questionId?: string
+}
+
+export interface PathStep {
+  id: string
+  nodeId: string
+  action: 'diagnose' | 'gap' | 'review'
+  prerequisites: string[]
+  blockedBy: string[]
+  dependents: string[]
+  invalid: boolean
+  evidence: string
+  reason: string
+  done?: boolean
+}
+
+export interface LearningPath {
+  packId: string
+  revision: string
+  version: number
+  steps: PathStep[]
+  checkedAt: number
+  reason: string
 }
 
 /** 一次作答对某个考点的证据分量（一道题可能同时挂多个考点） */
@@ -188,6 +248,9 @@ export interface AppState {
   mastery: Record<string, Mastery>
   attempts: AttemptRecord[]
   tasks: Task[]
+  path?: LearningPath
+  diagnostic?: DiagnosticRound
+  signals?: LearningSignal[]
 }
 
 export interface SubmitPayload {
@@ -196,7 +259,15 @@ export interface SubmitPayload {
   durationMs: number
   selfConfidence: SelfConfidence
   errorReason: ErrorReason
+  submissionId?: string
+  taskId?: string
+  diagnostic?: boolean
 }
+
+export type LearningUpdate =
+  | { kind: 'checkpoint'; reason: string; completedStep?: string }
+  | { kind: 'diagnostic'; round: DiagnosticRound }
+  | { kind: 'signal'; signal: LearningSignal }
 
 export interface SubmitResult {
   correct: boolean

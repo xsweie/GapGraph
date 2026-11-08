@@ -1,5 +1,7 @@
 import type { AttemptRecord, ErrorReason, KNode, Mastery } from '../../shared/types'
-import { effective, masteryScore } from '../../shared/mastery'
+import { masteryScore } from '../../shared/mastery'
+import { assessNode } from './learning'
+import { primaryAttemptNode } from './attempt-log'
 
 /** 错因的唯一列表，界面按这个顺序排按钮 */
 export const REASONS: { key: Exclude<ErrorReason, null>; label: string; hint: string }[] = [
@@ -127,12 +129,13 @@ export function suggestionFor(
   node: KNode,
   mastery: Record<string, Mastery>,
   nodes: KNode[],
-  now: number
+  now: number,
+  attempts: AttemptRecord[] = []
 ): Suggestion {
   const byId = new Map(nodes.map((n) => [n.id, n]))
-  const weakPre = node.prereq
-    .map((id) => ({ id, eff: effective(mastery[id] ?? { K: 0, A: 0.3, s: 1, n: 0, nok: 0, misconception: 0, lastAt: null }, now).eff }))
-    .sort((a, b) => a.eff - b.eff)[0]
+  const weakPre = node.prereq.filter((id) => byId.has(id))
+    .map((id) => ({ id, assessment: assessNode({ mastery, attempts }, id, now) }))
+    .find((p) => p.assessment.label !== '稳定')
   const preName = weakPre ? (byId.get(weakPre.id)?.name ?? weakPre.id) : ''
 
   switch (reason) {
@@ -145,11 +148,17 @@ export function suggestionFor(
     case 'method':
       return { text: '这是"方法不会"，需要先看一遍标准解法的步骤模板，再练两道同类题。' }
     case 'guess':
-      return { text: '这次基本靠猜，五天后会再考你一遍，别急着标记为掌握。' }
+      return { text: '回看解题依据，再用一道不同的题验证。' }
     case 'concept':
     default:
-      if (weakPre && weakPre.eff < 0.6) {
-        return { text: `这个考点本身没打牢，而且它依赖的「${preName}」你也不稳——先补那一块。`, goto: weakPre.id }
+      if (weakPre) {
+        const latest = [...new Map(attempts.filter((a) => !a.guessed && primaryAttemptNode(a) === weakPre.id)
+          .sort((a, b) => a.submittedAt - b.submittedAt).map((a) => [a.questionId, a])).values()]
+          .sort((a, b) => b.submittedAt - a.submittedAt).slice(0, 2)
+        if (weakPre.assessment.action === 'gap' && latest.length === 2 && latest.every((a) => !a.correct)) {
+          return { text: `必要前置「${preName}」在两道不同的题上连续出错，优先补这一块。`, goto: weakPre.id }
+        }
+        return { text: `先验证必要前置「${preName}」，再判断从哪里补起。`, goto: weakPre.id }
       }
       return { text: '这个考点本身没打牢，建议回看讲解，然后从最简单的题重新做起。' }
   }
@@ -171,7 +180,7 @@ export function attributionLine(
     label: REASON_LABEL[dom.reason] ?? dom.reason,
     count: dom.count,
     total,
-    suggestion: suggestionFor(dom.reason, node, mastery, nodes, now)
+    suggestion: suggestionFor(dom.reason, node, mastery, nodes, now, attempts)
   }
 }
 

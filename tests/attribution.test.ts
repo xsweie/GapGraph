@@ -148,16 +148,18 @@ describe('错因 → 建议', () => {
   const mastery: Record<string, Mastery> = blankMastery(nodes)
   const target = nodes[2]
 
-  it('概念不清且前置不稳 → 建议先补前置，并给出跳转目标', () => {
+  it('有低估计但无两道有效主考点题时先验证前置', () => {
     mastery.base = { ...freshMastery(0.5), A: 0.1, n: 3, lastAt: NOW }
     const s = suggestionFor('concept', target, mastery, nodes, NOW)
     expect(s.goto).toBe('base')
     expect(s.text).toContain('base')
+    expect(s.text).toContain('先验证')
   })
 
   it('前置其实还行 → 不给跳转，建议回看讲解', () => {
     mastery.base = { ...freshMastery(1), A: 0.9, n: 5, lastAt: NOW }
-    const s = suggestionFor('concept', target, mastery, nodes, NOW)
+    const evidence = ['a', 'b'].map((id) => ({ ...attempt(id, 'base', true, null), questionId: id }))
+    const s = suggestionFor('concept', target, mastery, nodes, NOW, evidence)
     expect(s.goto).toBeUndefined()
   })
 

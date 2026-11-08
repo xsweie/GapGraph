@@ -2,6 +2,7 @@
 node_modules/
 out/
 .data/
+.logs/
 .cache/
 *.log
 *.tsbuildinfo
@@ -17,8 +18,10 @@ Thumbs.db
 hackathon_guide.html
 *.pdf
 
-# 本地凭据（本项目通过环境变量或 ~/.dsh 读取，永不入库）
+# 本地凭据（Windows DPAPI 文件也在已忽略的 .data/ 下）
 .env
 .env.*
+.credentials.yaml
+*.dpapi
 *.pem
 *.key

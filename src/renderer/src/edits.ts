@@ -1,4 +1,6 @@
 import type { KNode, Pack, Relation } from '../../shared/types'
+import { packRevision } from '../../main/domain/learning'
+import { alignGraph, validateGraph, validateScope } from '../../main/domain/scope'
 
 /**
  * 用户对板块的本地修改（增删考点、拖动位置）。
@@ -10,6 +12,70 @@ import type { KNode, Pack, Relation } from '../../shared/types'
 
 const editKey = (packId: string): string => `gapgraph.edit.${packId}.v1`
 const posKey = (packId: string): string => `gapgraph.pos.${packId}.v1`
+const revisionKey = (id: string): string => `gapgraph.structure.${id}.v1`
+
+interface Structure {
+  current: Pack
+  previous?: Pack
+  knownIds: string[]
+}
+
+function readStructure(id: string): Structure | null {
+  const raw = localStorage.getItem(revisionKey(id))
+  const structure = raw ? JSON.parse(raw) as Structure : null
+  if (structure && structure.current?.packId !== id) throw new Error('板块修订记录不匹配。')
+  return structure
+}
+
+export function effectivePack(base: Pack): Pack {
+  let stored: Structure | null = null
+  try { stored = readStructure(base.packId) } catch { /* 仍可读取旧板块 */ }
+  return stored?.current ?? alignGraph(applyEdits(base, loadEdits(base.packId)))
+}
+
+export function hasUndo(id: string): boolean {
+  try { return !!readStructure(id)?.previous } catch { return false }
+}
+
+function revisionId(): string {
+  return 'r-' + Date.now().toString(36) + '-' + Math.random().toString(36).slice(2)
+}
+
+async function withRevisionLock<T>(id: string, change: () => T): Promise<T> {
+  return navigator.locks ? navigator.locks.request(revisionKey(id), change) : change()
+}
+
+export async function commitStructure(base: Pack, expected: string, candidate: Pack): Promise<void> {
+  await withRevisionLock(base.packId, () => {
+    const stored = readStructure(base.packId)
+    const current = stored?.current ?? effectivePack(base)
+    if (candidate.packId !== base.packId || packRevision(current) !== expected) throw new Error('预览已过期，请重新打开范围编辑。')
+    const known = new Set([...(stored?.knownIds ?? []), ...base.nodes.map((n) => n.id), ...current.nodes.map((n) => n.id), ...loadEdits(base.packId).removed])
+    const currentIds = new Set(current.nodes.map((n) => n.id))
+    if (candidate.nodes.some((n) => !currentIds.has(n.id) && known.has(n.id))) throw new Error('新增考点必须使用新 ID，归档考点不能复用。')
+    if (candidate.subject !== current.subject && candidate.nodes.some((n) => n.kind !== 'root' && currentIds.has(n.id))) {
+      throw new Error('更换学科时请新建板块，或为所有含义改变的考点使用新 ID。')
+    }
+    if (candidate.scope) validateScope(candidate.scope)
+    validateGraph(candidate, !!candidate.scope)
+    const next: Pack = { ...candidate, revision: revisionId(), scope: candidate.scope && {
+      ...candidate.scope, version: (current.scope?.version ?? 0) + 1
+    } }
+    for (const n of next.nodes) known.add(n.id)
+    localStorage.setItem(revisionKey(base.packId), JSON.stringify({ current: next, previous: current, knownIds: [...known] }))
+  })
+}
+
+export async function undoStructure(id: string, expected: string): Promise<void> {
+  await withRevisionLock(id, () => {
+    const stored = readStructure(id)
+    if (!stored?.previous || packRevision(stored.current) !== expected) throw new Error('没有可撤销的当前修订，请刷新。')
+    const current = { ...stored.previous, revision: revisionId(), scope: stored.previous.scope && {
+      ...stored.previous.scope, version: (stored.current.scope?.version ?? 0) + 1
+    } }
+    localStorage.setItem(revisionKey(id), JSON.stringify({ current, knownIds: stored.knownIds }))
+  })
+}
 
 export interface PackEdits {
   added: KNode[]
@@ -57,7 +123,7 @@ export function applyEdits(pack: Pack, edits: PackEdits): Pack {
   for (const a of edits.added) {
     if (exists.has(a.id)) continue
     const parent = a.parentId && exists.has(a.parentId) ? a.parentId : (root?.id ?? null)
-    nodes.push({ ...a, parentId: parent })
+    nodes.push({ ...a, parentId: parent, edited: true })
     exists.add(a.id)
   }
 

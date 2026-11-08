@@ -1,4 +1,4 @@
-import type { AppState, KNode, Mastery, Question, Task } from '../../shared/types'
+import type { AppState, KNode, LearningPath, Mastery, Question, Task } from '../../shared/types'
 import { dueUrgency, isDue, retention, freshMastery } from './mastery'
 import { questionsForNode, rankGaps } from './priority'
 
@@ -10,6 +10,8 @@ export interface BuildQueueArgs {
   dailyMinutes: number
   daysLeft: number
   date: string
+  path?: LearningPath
+  previous?: Task[]
 }
 
 const REVIEW_MINUTES = 8
@@ -23,6 +25,7 @@ const MAX_CARDS = 3
  * 硬规矩：总时长不超过用户设定，装不下就少给 —— 宁可少给，也不能给到想卸载。
  */
 export function buildToday(args: BuildQueueArgs): Task[] {
+  if (args.path) return buildPathToday(args, args.path)
   const { nodes, questions, mastery, now, dailyMinutes, daysLeft, date } = args
   const tasks: Task[] = []
   const used = new Set<string>()
@@ -91,13 +94,13 @@ export function buildToday(args: BuildQueueArgs): Task[] {
   /* 4) 太少就补一个轻动作，避免"今天没事干" */
   if (out.length === 0) {
     const fallback = ranked.find((g) => !used.has(g.node.id) && g.node.kind !== 'root')
-    if (fallback) {
+    if (fallback && dailyMinutes >= 4) {
       const qs = questionsForNode(fallback.node.id, questions).slice(0, 1)
       if (qs.length) {
         out.push({
-          id: `${date}-gap-${fallback.node.id}`,
+          id: `${date}-${fallback.reason === 'diagnose' ? 'diag1' : 'gap'}-${fallback.node.id}`,
           date,
-          kind: 'gap',
+          kind: fallback.reason === 'diagnose' ? 'diagnose' : 'gap',
           nodeId: fallback.node.id,
           questionIds: qs.map((q) => q.id),
           estMinutes: 4,
@@ -109,6 +112,35 @@ export function buildToday(args: BuildQueueArgs): Task[] {
   }
 
   return out
+}
+
+function buildPathToday(args: BuildQueueArgs, path: LearningPath): Task[] {
+  const previous = (args.previous ?? []).filter((t) => t.date === args.date)
+  const retained = previous.filter((t) => t.status !== 'pending' || (t.spentMinutes ?? 0) > 0)
+  const tasks = retained.filter((t) => t.status === 'done')
+  let budget = args.dailyMinutes - retained.reduce((sum, t) => sum + (t.spentMinutes ?? (t.status === 'done' ? t.estMinutes : 0)), 0)
+  let reviews = tasks.filter((t) => t.kind === 'review').length
+  for (const step of path.steps) {
+    if (tasks.length >= MAX_CARDS) break
+    if (step.done || step.invalid || step.blockedBy.length || (step.action === 'review' && reviews >= 2)) continue
+    const id = `${args.date}-${step.action === 'diagnose' ? 'diag1' : step.action}-${step.nodeId}`
+    const prior = previous.find((t) => t.id === id)
+    if (prior && prior.status !== 'pending') continue
+    const qs = args.questions.filter((q) => (q.tags.find((t) => t.primary) ?? q.tags[0])?.nodeId === step.nodeId)
+    const standard = step.action === 'review' ? REVIEW_MINUTES : step.action === 'gap' ? GAP_MINUTES : DIAGNOSE_MINUTES
+    const cost = budget >= standard ? standard : budget >= 4 ? 4 : 0
+    if (!cost) continue
+    budget -= cost
+    if (step.action === 'review') reviews++
+    tasks.push({
+      id, date: args.date, kind: step.action, nodeId: step.nodeId, stepId: step.id,
+      questionIds: qs.slice(0, cost === 4 ? 1 : 3).map((q) => q.id), estMinutes: cost,
+      spentMinutes: prior?.spentMinutes, status: 'pending', sortOrder: tasks.length
+    })
+  }
+  // A postponed card still prevents the same action being recreated today.
+  return [...tasks, ...retained.filter((t) => t.status !== 'done' && !tasks.some((task) => task.id === t.id))
+    .map((t): Task => ({ ...t, status: 'postponed' }))]
 }
 
 /** 新建状态时给所有考点铺一层默认掌握（根节点只是容器，不参与评估） */

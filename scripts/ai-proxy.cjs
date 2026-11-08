@@ -12,8 +12,8 @@
  */
 const http = require('node:http')
 const fs = require('node:fs')
-const os = require('node:os')
 const path = require('node:path')
+const { loadKey } = require('./deepseek-key.cjs')
 const { qcProblems, verifyPromptFor } = require('./question-qc.cjs')
 
 const PORT = Number(process.env.AI_PROXY_PORT || 3300)
@@ -21,15 +21,12 @@ const HOST = '127.0.0.1'
 const UPSTREAM = 'https://api.deepseek.com/chat/completions'
 const MODEL = 'deepseek-chat'
 
-function loadKey() {
-  if (process.env.DEEPSEEK_API_KEY) return process.env.DEEPSEEK_API_KEY
-  const f = path.join(os.homedir(), '.dsh', '.credentials.yaml')
-  if (!fs.existsSync(f)) return null
-  const raw = fs.readFileSync(f, 'utf8')
-  const m =
-    raw.match(/DEEPSEEK_API_KEY[\s\S]{0,200}?(sk-[A-Za-z0-9_\-]{10,})/) ||
-    raw.match(/(sk-[A-Za-z0-9_\-]{20,})/)
-  return m ? m[1] : null
+function scopeContext(scope) {
+  if (!scope || typeof scope !== 'object') return ''
+  return '\n当前已确认学习范围：' + JSON.stringify({
+    stage: scope.stage, subject: scope.subject, topic: scope.topic, goal: scope.goal,
+    depth: scope.depth, include: scope.include, exclude: scope.exclude, foundations: scope.foundations
+  }).slice(0, 5000)
 }
 
 const KEY = loadKey()
@@ -151,7 +148,7 @@ const server = http.createServer(async (req, res) => {
   }
 
   if (req.method === 'GET' && req.url === '/health') {
-    json(res, 200, { ok: true, model: MODEL, routes: ['chat', 'pack', 'questions', 'explain'], pid: process.pid })
+    json(res, 200, { ok: true, model: MODEL, routes: ['scope', 'chat', 'pack', 'questions', 'explain'], pid: process.pid })
     return
   }
 
@@ -184,20 +181,40 @@ const server = http.createServer(async (req, res) => {
     return
   }
 
-  if (req.method !== 'POST' || !['/chat', '/pack', '/questions', '/explain'].includes(req.url)) {
+  if (req.method !== 'POST' || !['/scope', '/chat', '/pack', '/questions', '/explain'].includes(req.url)) {
     json(res, 404, { error: 'not found' })
     return
   }
 
-  /* ---------- 生成考纲骨架：任何考试、任何章节都装得进来 ---------- */
+  if (req.url === '/scope') {
+    try {
+      const body = await readBody(req)
+      const request = String(body.request || '').trim().slice(0, 1600)
+      if (!request) return json(res, 400, { error: '请描述学习目标或范围调整。' })
+      const data = await upstreamRetry({
+        model: MODEL, temperature: 0.25, response_format: { type: 'json_object' },
+        messages: [
+          { role: 'system', content: '根据学生已经提供的信息拟定可编辑的学习范围，不重复询问已给出的信息。应考复习与章节补齐都是目标。存在影响范围的关键歧义时，只问一个问题。其余字段能推断则填写，否则留空。仅输出 JSON：{"stage":"学段","subject":"学科","topic":"主题","goal":"目标","depth":"深度","include":["纳入项"],"exclude":["排除项"],"foundations":["必要前置"],"question":"唯一追问或空字符串"}。若已有范围，保留用户未要求修改的部分，适用新描述。' },
+          { role: 'user', content: request + scopeContext(body.scope) }
+        ]
+      })
+      json(res, 200, JSON.parse(data.choices?.[0]?.message?.content ?? '{}'))
+    } catch (e) {
+      json(res, 502, { error: '范围草案生成失败：' + e.message })
+    }
+    return
+  }
+
+  /* ---------- 生成知识网 ---------- */
   if (req.url === '/pack') {
     try {
       const body = await readBody(req)
-      const exam = String(body.exam || '').slice(0, 40)
-      const subject = String(body.subject || '').slice(0, 40)
-      const chapter = String(body.chapter || '').slice(0, 60)
-      if (!exam || !subject || !chapter) {
-        json(res, 400, { error: '缺少 exam / subject / chapter' })
+      const scope = body.scope
+      const exam = String(scope?.stage || body.exam || '').slice(0, 40)
+      const subject = String(scope?.subject || body.subject || '').slice(0, 40)
+      const chapter = String(scope?.topic || body.chapter || '').slice(0, 60)
+      if (!exam || !subject || !chapter || (scope && (!scope.goal || !scope.depth || !scope.include?.length))) {
+        json(res, 400, { error: '缺少已确认的学习范围。' })
         return
       }
 
@@ -210,7 +227,8 @@ const server = http.createServer(async (req, res) => {
           messages: [
             {
               role: 'system',
-              content: `你是学科教研员。把某个章节拆成一张可供学生自测的知识地图。
+              content: scope ? `你是学科教研员。只按已确认范围、学段、目标与深度生成知识网。节点数随主题粒度，可只有一个考点和根。不要引入排除项。仅输出 JSON：{"nodes":[{"id":"n1","name":"考点","kind":"root|concept|skill","parentId":null,"prereq":[],"confusable":[],"scopeIds":[],"supplementary":false,"examWeight":0.5,"brief":"讲解"}]}。
+根唯一且没有父级。其余节点有有效父级。每项纳入项和必要前置都须被关联，使用输入中的条目 ID。补充基础确有必要才加，标 supplementary=true。prereq 只填必学的前置 ID。父级和前置禁止成环。重要性按本次学习目标估计。修改已有图时，同一含义只改名或移动保留原 ID。含义改变或拆分合并时用新的 ID，旧 ID 从结果移除。保留未要求改变的手工节点和锁定权重。` : `你是学科教研员。把某个章节拆成一张可供学生自测的知识地图。
 只输出 JSON，不要任何解释。节点数量 18–32 个，必须覆盖该章节的完整考点。
 每个节点的 brief 一句话（30 字以内，说清"是什么/怎么考"）。
 严格按此结构输出：
@@ -224,7 +242,8 @@ const server = http.createServer(async (req, res) => {
             },
             {
               role: 'user',
-              content: `考试：${exam}\n科目：${subject}\n章节：${chapter}`
+              content: scope ? scopeContext(scope) + '\n变更请求：' + String(body.request || '').slice(0, 1000) +
+                '\n当前结构：' + JSON.stringify(body.current ?? []).slice(0, 12000) : `考试：${exam}\n科目：${subject}\n章节：${chapter}`
             }
           ]
         },
@@ -239,7 +258,7 @@ const server = http.createServer(async (req, res) => {
         return
       }
       const nodes = Array.isArray(parsed.nodes) ? parsed.nodes : []
-      if (nodes.length < 5) {
+      if (nodes.length < (scope ? 2 : 5)) {
         json(res, 502, { error: `生成的节点太少（${nodes.length} 个）` })
         return
       }
@@ -287,7 +306,7 @@ const server = http.createServer(async (req, res) => {
           temperature: 0.8,
           response_format: { type: 'json_object' },
           messages: [
-            { role: 'system', content: teacherSystem(exam, subject) },
+            { role: 'system', content: teacherSystem(exam, subject) + scopeContext(body.scope) },
             {
               role: 'user',
               content: `章节：${chapter || '（未提供）'}\n考点：${nodeName}\n简述：${brief || '（无）'}\n重要性估计：${examWeight}（0-1，主观判断，非考频统计）
@@ -360,7 +379,7 @@ const server = http.createServer(async (req, res) => {
               temperature: 0,
               response_format: { type: 'json_object' },
               messages: [
-                { role: 'system', content: verifySystem(exam, subject) },
+                { role: 'system', content: verifySystem(exam, subject) + scopeContext(body.scope) },
                 { role: 'user', content: verifyPromptFor(q) }
               ]
             },
@@ -444,7 +463,7 @@ const server = http.createServer(async (req, res) => {
           messages: [
             {
               role: 'system',
-              content: `你是${who}老师，正在给一个学生写某个考点的**详细讲解**。只输出 JSON。
+              content: `你是${who}老师，正在给一个学生写某个考点的**详细讲解**。只输出 JSON。${scopeContext(body.scope)}
 要求：
 - 讲透，不要泛泛而谈；每一句都要有信息量，不要复述题干
 - 用学生能直接用的语言，必要处给具体条件、公式、判别步骤
@@ -514,7 +533,7 @@ const server = http.createServer(async (req, res) => {
         temperature: 0.5,
         response_format: { type: 'json_object' },
         messages: [
-          { role: 'system', content: qaSystem(body.exam, body.subject) },
+          { role: 'system', content: qaSystem(body.exam, body.subject) + scopeContext(body.scope) },
           {
             role: 'user',
             content: `${context ? `【学生刚做完的一道题】\n${context}\n\n（学生已经作答并看过解析，现在是针对这道题的追问）\n\n` : ''}考点：${nodeName}（${nodePath}）\n已有讲解：${explain}\n学生的提问：${question}`
@@ -545,11 +564,22 @@ const server = http.createServer(async (req, res) => {
   }
 })
 
+server.on('error', (error) => {
+  console.error(`[ai-proxy] 无法监听 ${HOST}:${PORT}（${error.code || error.message}）`)
+  process.exitCode = 1
+})
+
 server.listen(PORT, HOST, () => {
+  const address = server.address()
+  const url = `http://${address.address}:${address.port}`
+  console.log(`[ai-proxy] 已启动 ${url}  model=${MODEL}`)
+  if (process.env.GAPGRAPH_RUN_DIR) {
+    fs.writeFileSync(path.join(process.env.GAPGRAPH_RUN_DIR, 'ai.json'), JSON.stringify({ url, pid: process.pid }))
+    return
+  }
   const hasBuild = fs.existsSync(path.resolve('out/web/index.html'))
-  console.log(`[ai-proxy] 已启动 http://${HOST}:${PORT}  model=${MODEL}`)
   if (hasBuild) {
-    console.log(`[ai-proxy] 直接打开 http://${HOST}:${PORT} 就是完整应用，实时问答自动可用`)
+    console.log(`[ai-proxy] 直接打开 ${url} 就是完整应用，实时问答自动可用`)
   } else {
     console.log('[ai-proxy] 提示：还没构建前端，先运行 npm run build:web')
   }

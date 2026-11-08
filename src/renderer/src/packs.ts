@@ -1,4 +1,5 @@
 import type { AppState, Pack, Question } from '../../shared/types'
+import { effectivePack } from './edits'
 import { blankMastery } from '../../main/domain/queue'
 import builtin from '../../../resources/packs/gaokao-math-function.json'
 import builtinQuestions from '../../../resources/questions/gaokao-math-function.json'
@@ -44,33 +45,22 @@ function renames(): Record<string, string> {
 
 export function listPacks(): PackEntry[] {
   const rn = renames()
-  const metaOf = (p: Pack): { exam: string; subject: string; chapter: string } => ({
-    exam: p.meta?.exam ?? '',
-    subject: p.meta?.subject ?? p.subject ?? '',
-    chapter: p.meta?.chapter ?? p.title
+  return [BUILTIN, ...Object.values(customPacks())].map((base) => {
+    const p = effectivePack(base)
+    return {
+      id: p.packId, builtin: p.packId === BUILTIN.packId,
+      title: rn[p.packId] ?? p.title, chapter: rn[p.packId] ?? p.meta?.chapter ?? p.title,
+      exam: p.meta?.exam ?? '', subject: p.scope?.subject ?? p.subject
+    }
   })
-  const bm = metaOf(BUILTIN)
-  const out: PackEntry[] = [
-    { id: BUILTIN.packId, title: rn[BUILTIN.packId] ?? BUILTIN.title, builtin: true, ...bm }
-  ]
-  for (const p of Object.values(customPacks())) {
-    const m = metaOf(p)
-    out.push({
-      id: p.packId,
-      title: rn[p.packId] ?? p.title,
-      builtin: false,
-      ...m,
-      chapter: rn[p.packId] ?? m.chapter
-    })
-  }
-  return out
 }
 
 /** 改名：内置的存覆写，自定义的直接改数据 */
 export function renamePack(id: string, newTitle: string): void {
   const title = newTitle.trim().slice(0, 40)
   if (!title) return
-  if (id === BUILTIN.packId) {
+  const base = resolvePack(id)
+  if (id === BUILTIN.packId || (base && effectivePack(base).revision)) {
     const rn = renames()
     rn[id] = title
     try {
@@ -95,7 +85,7 @@ export function renamePack(id: string, newTitle: string): void {
 /** 取某个板块现有的全部题目（内置来自随包文件，自定义来自本地缓存） */
 export function questionsOfPack(packId: string): Question[] {
   if (packId === BUILTIN.packId) {
-    return (builtinQuestions as unknown as { questions: Question[] }).questions
+    return [...(builtinQuestions as unknown as { questions: Question[] }).questions, ...loadBank(packId)]
   }
   return loadBank(packId)
 }
@@ -109,7 +99,7 @@ export function stateOfPack(pack: Pack): AppState {
     /* 落到默认 */
   }
   return {
-    settings: { dailyMinutes: 40, examDate: '2027-06-07', totalScore: pack.totalScore, packId: pack.packId },
+    settings: { dailyMinutes: 40, examDate: '', totalScore: pack.totalScore, packId: pack.packId },
     mastery: blankMastery(pack.nodes),
     attempts: [],
     tasks: []
@@ -164,11 +154,7 @@ export function currentPack(): Pack | null {
 export function saveCustomPack(pack: Pack): void {
   const all = customPacks()
   all[pack.packId] = pack
-  try {
-    localStorage.setItem(CUSTOM_KEY, JSON.stringify(all))
-  } catch {
-    /* 忽略 */
-  }
+  localStorage.setItem(CUSTOM_KEY, JSON.stringify(all))
 }
 
 export function removeCustomPack(id: string): void {
@@ -205,7 +191,8 @@ export function markStudied(packId: string): void {
 }
 
 export function packProgress(packId: string): PackProgress {
-  const pack = resolvePack(packId)
+  const base = resolvePack(packId)
+  const pack = base && effectivePack(base)
   const total = pack ? pack.nodes.filter((n) => n.kind !== 'root').length : 0
   let measured = 0
   let lastAt = 0
@@ -214,7 +201,7 @@ export function packProgress(packId: string): PackProgress {
     if (raw) {
       const s = JSON.parse(raw) as { mastery?: Record<string, { n?: number }>; attempts?: { submittedAt?: number }[] }
       const m = s.mastery ?? {}
-      measured = Object.values(m).filter((x) => (x?.n ?? 0) > 0).length
+      measured = pack?.nodes.filter((n) => n.kind !== 'root' && (m[n.id]?.n ?? 0) > 0).length ?? 0
       const last = s.attempts?.[s.attempts.length - 1]
       lastAt = last?.submittedAt ?? 0
     }

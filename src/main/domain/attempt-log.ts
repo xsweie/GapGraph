@@ -53,3 +53,7 @@ export function nodesOfAttempt(a: AttemptRecord): AttemptTag[] {
   if (Array.isArray(a.tags) && a.tags.length) return a.tags
   return [{ nodeId: a.nodePrimary, weight: 1, primary: true }]
 }
+
+export function primaryAttemptNode(a: AttemptRecord): string | undefined {
+  return nodesOfAttempt(a).find((tag) => tag.primary)?.nodeId
+}

@@ -1,17 +1,12 @@
-import type { KNode, Mastery, Question } from '../../shared/types'
+import type { DiagnosticRound, KNode, Mastery, Question } from '../../shared/types'
 import { band, masteryScore } from '../../shared/mastery'
+import { primaryBranch } from './learning'
 
-/** 摸底的目标题量：12–15 题，超过就停 */
-export const DIAG_TARGET = 15
+export const DIAG_TARGET = 10
 /** 少于这个数不做结论 */
 export const DIAG_MIN = 6
 
-export interface DiagState {
-  askedIds: string[]
-  answered: { questionId: string; nodeId: string; correct: boolean }[]
-  /** 下一题想考的难度，答对加一、答错减一 */
-  targetDifficulty: number
-}
+export type DiagState = DiagnosticRound
 
 export function createDiagnostic(): DiagState {
   return { askedIds: [], answered: [], targetDifficulty: 2 }
@@ -34,10 +29,11 @@ export function nextQuestion(
   nodes: KNode[],
   mastery: Record<string, Mastery>
 ): Question | null {
-  if (state.askedIds.length >= DIAG_TARGET) return null
+  if (state.askedIds.length >= DIAG_TARGET || diagnosticCoverage(state, nodes).ready) return null
 
   const byId = new Map(nodes.map((n) => [n.id, n]))
-  const covered = new Set(state.answered.map((a) => a.nodeId))
+  const covered = new Set(state.answered.filter((a) => !a.guessed).map((a) => a.nodeId))
+  const branches = new Set([...covered].map((id) => primaryBranch(id, nodes)))
   const lastWrong = [...state.answered].reverse().find((a) => !a.correct)
   const drill = new Set(lastWrong ? (byId.get(lastWrong.nodeId)?.prereq ?? []) : [])
 
@@ -50,6 +46,7 @@ export function nextQuestion(
     if (!node) continue
 
     let score = 0
+    if (!branches.has(primaryBranch(nodeId, nodes))) score += 12
     if (!covered.has(nodeId)) score += 3
     if (drill.has(nodeId)) score += 4
     score += 2 * node.examWeight
@@ -66,18 +63,32 @@ export function applyDiagAnswer(
   state: DiagState,
   questionId: string,
   nodeId: string,
-  correct: boolean
+  correct: boolean,
+  guessed = false
 ): DiagState {
+  if (state.askedIds.includes(questionId) || state.askedIds.length >= DIAG_TARGET) return state
   return {
+    ...state,
     askedIds: [...state.askedIds, questionId],
-    answered: [...state.answered, { questionId, nodeId, correct }],
-    targetDifficulty: correct
+    answered: [...state.answered, { questionId, nodeId, correct, guessed }],
+    targetDifficulty: guessed ? state.targetDifficulty : correct
       ? Math.min(5, state.targetDifficulty + 1)
       : Math.max(1, state.targetDifficulty - 1)
   }
 }
 
+export function diagnosticCoverage(state: DiagState, nodes: KNode[]) {
+  const valid = new Set(nodes.filter((n) => n.kind !== 'root').map((n) => n.id))
+  const effective = state.answered.filter((a) => !a.guessed && valid.has(a.nodeId))
+  const distinct = new Set(effective.map((a) => a.questionId)).size
+  const covered = new Set(effective.map((a) => primaryBranch(a.nodeId, nodes)).filter(Boolean)).size
+  const root = nodes.find((n) => n.kind === 'root')
+  const branches = nodes.filter((n) => n.parentId === root?.id).length
+  return { effective: distinct, covered, branches, required: Math.min(3, branches), ready: distinct >= DIAG_MIN && covered >= Math.min(3, branches) }
+}
+
 export interface DiagSummary {
+  progress: ReturnType<typeof diagnosticCoverage>
   answered: number
   touched: number
   /** 摸底结束时的分档统计；self/unmeasured 不会出现（这些节点都答过题） */
@@ -92,7 +103,7 @@ export function summarize(
   mastery: Record<string, Mastery>,
   now: number
 ): DiagSummary {
-  const touchedIds = [...new Set(state.answered.map((a) => a.nodeId))]
+  const touchedIds = [...new Set(state.answered.filter((a) => !a.guessed).map((a) => a.nodeId))]
   const bands = { red: 0, orange: 0, yellow: 0, green: 0, self: 0 }
   const scored: { id: string; name: string; score: number }[] = []
 
@@ -109,6 +120,7 @@ export function summarize(
   scored.sort((a, b) => a.score - b.score)
 
   return {
+    progress: diagnosticCoverage(state, nodes),
     answered: state.answered.length,
     touched: touchedIds.length,
     bands,

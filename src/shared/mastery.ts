@@ -179,12 +179,12 @@ const SLIP: Record<string, true> = { calc: true, misread: true }
 
 /**
  * 一次作答对单个考点的更新。
- * 蒙对：不计入证据（n 不变），只刷新接触时间 —— 避免"靠蒙把图刷绿"。
+ * 疑似蒙对仅保留原始作答，不刷新能力、证据和复习时钟。
  * 「我很确定但答错」：标记 misconception，掌握度额外打八五折（手滑类不算）。
  */
 export function applyAttempt(m: Mastery, e: AttemptEffect): Mastery {
   if (e.guessed && e.correct) {
-    return { ...m, lastAt: e.now }
+    return m
   }
 
   const days = m.lastAt ? (e.now - m.lastAt) / DAY : 0

@@ -1,7 +1,7 @@
 import { app, BrowserWindow, ipcMain, shell } from 'electron'
 import { join } from 'node:path'
 import { Service } from './service'
-import type { SubmitPayload } from '../shared/types'
+import type { LearningUpdate, SubmitPayload } from '../shared/types'
 
 let win: BrowserWindow | null = null
 let service: Service | null = null
@@ -71,8 +71,11 @@ app.whenReady().then(() => {
 
   ipcMain.handle('queue:rebuild', () => {
     const s = svc()
-    return { today: s.rebuild(), overview: s.overview() }
+    s.rebuild()
+    return { ...s.load(), overview: s.overview() }
   })
+
+  ipcMain.handle('learning:update', (_e, update: LearningUpdate) => svc().learning(update))
 
   ipcMain.handle('answer:check', (_e, args: { questionId: string; answer: string }) => {
     return svc().check(args.questionId, args.answer)

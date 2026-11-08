@@ -1,9 +1,10 @@
 {
   "name": "gapgraph",
-  "version": "1.12.1",
+  "version": "1.13.0",
   "private": true,
   "description": "GapGraph 缺口图谱 · 备考掌握度可视化与每日补习计划",
   "main": "./out/main/index.js",
+  "engines": { "node": ">=22.12.0" },
   "scripts": {
     "dev": "electron-vite dev",
     "dev:web": "vite --config vite.web.config.ts",

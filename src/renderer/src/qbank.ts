@@ -65,7 +65,7 @@ export function addToBank(packId: string, items: NewQuestion[], nodeId: string):
       tags: [{ nodeId, weight: 1, primary: true }]
     })
   }
-  persist(packId, [...bank, ...added])
+  if (added.length) localStorage.setItem(key(packId), JSON.stringify([...bank, ...added]))
   return added
 }
 

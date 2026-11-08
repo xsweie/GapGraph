@@ -1,11 +1,13 @@
 import { app } from 'electron'
 import { existsSync, mkdirSync, readFileSync, writeFileSync } from 'node:fs'
 import { join } from 'node:path'
-import type { AppState, LoadResult, Pack, Question, SubmitPayload, SubmitResult, Task } from '../shared/types'
-import { DAY, applyAttempt, band, effective, freshMastery, masteryScore, migrateMastery, setSelfLevel } from './domain/mastery'
-import { buildToday, blankMastery, coverage, daysUntil } from './domain/queue'
+import type { AppState, LearningUpdate, LoadResult, Pack, Question, SubmitPayload, SubmitResult, Task } from '../shared/types'
+import { DAY, effective, freshMastery, migrateMastery, setSelfLevel } from './domain/mastery'
+import { blankMastery, coverage, daysUntil } from './domain/queue'
 import { isCorrect } from './domain/grading'
-import { buildAttemptRecord } from './domain/attempt-log'
+import { applyLearningUpdate, restoreEvidenceClocks, todayFromPath } from './domain/learning-state'
+import { submitAnswer } from './domain/submission'
+import { alignGraph } from './domain/scope'
 
 interface QuestionBank {
   packId: string
@@ -37,7 +39,7 @@ export class Service {
 
   constructor() {
     const root = resourceRoot()
-    this.pack = readJson<Pack>(join(root, 'packs', 'gaokao-math-function.json'))
+    this.pack = alignGraph(readJson<Pack>(join(root, 'packs', 'gaokao-math-function.json')))
     const bank = readJson<QuestionBank>(join(root, 'questions', 'gaokao-math-function.json'))
     this.questions = bank.questions
 
@@ -51,7 +53,7 @@ export class Service {
     return {
       settings: {
         dailyMinutes: 40,
-        examDate: '2027-06-07',
+        examDate: '',
         totalScore: this.pack.totalScore,
         packId: this.pack.packId
       },
@@ -71,6 +73,7 @@ export class Service {
       }
       // v1 → v2 迁移：把自评/能力/保持/可信度拆开。幂等，重复执行不改任何数。
       for (const id of Object.keys(s.mastery)) s.mastery[id] = migrateMastery(s.mastery[id])
+      restoreEvidenceClocks(s)
       s.schemaVersion = 2
       return s
     } catch {
@@ -86,26 +89,23 @@ export class Service {
     return daysUntil(this.state.settings.examDate, now)
   }
 
-  today(now = Date.now()): Task[] {
-    const key = todayKey(now)
-    const existing = this.state.tasks.filter((t) => t.date === key)
-    if (existing.length > 0) return existing.sort((a, b) => a.sortOrder - b.sortOrder)
-    return this.rebuild(now, key)
+  today(now = Date.now(), reason?: string, stepId?: string): Task[] {
+    const before = this.state.path
+    const tasks = todayFromPath(this.pack, this.state, this.questions, now, todayKey(now), reason, stepId)
+    if (before !== this.state.path) this.save()
+    return tasks
   }
 
-  rebuild(now = Date.now(), key = todayKey(now)): Task[] {
-    const tasks = buildToday({
-      nodes: this.pack.nodes,
-      questions: this.questions,
-      mastery: this.state.mastery,
-      now,
-      dailyMinutes: this.state.settings.dailyMinutes,
-      daysLeft: this.daysLeft(now),
-      date: key
-    })
-    this.state.tasks = [...this.state.tasks.filter((t) => t.date !== key), ...tasks]
+  rebuild(): Task[] {
+    return this.today(Date.now(), '手动重新规划')
+  }
+
+  learning(update: LearningUpdate) {
+    applyLearningUpdate(this.state, update)
+    const today = this.today(Date.now(), update.kind === 'checkpoint' ? update.reason : undefined,
+      update.kind === 'checkpoint' ? update.completedStep : undefined)
     this.save()
-    return tasks
+    return { state: this.state, today, overview: this.overview() }
   }
 
   load(): LoadResult {
@@ -120,75 +120,17 @@ export class Service {
 
   submit(payload: SubmitPayload): SubmitResult {
     const now = Date.now()
-    const q = this.questions.find((x) => x.id === payload.questionId)
-    if (!q) throw new Error(`题目不存在: ${payload.questionId}`)
-
-    const correct = isCorrect(q, payload.answer)
-    // 疑似蒙对：3 秒内答对一道中高难度题
-    const guessed = correct && payload.durationMs < 3000 && q.difficulty >= 3
-
-    const primary = q.tags.find((t) => t.primary) ?? q.tags[0]
-    const mBefore = this.state.mastery[primary.nodeId] ?? freshMastery(0)
-    const before = masteryScore(mBefore, now)
-    const beforeBand = band(mBefore, now)
-
-    for (const tag of q.tags) {
-      const m = this.state.mastery[tag.nodeId] ?? freshMastery(0)
-      // 答错时次考点影响再打三折，避免"一题连坐"
-      const weight = tag.primary || correct ? tag.weight : tag.weight * 0.3
-      this.state.mastery[tag.nodeId] = applyAttempt(m, {
-        difficulty: q.difficulty,
-        correct,
-        weight,
-        sure: payload.selfConfidence === 'sure',
-        guessed,
-        now,
-        errorReason: correct ? null : payload.errorReason
-      })
-    }
-
-    this.state.attempts.push(
-      buildAttemptRecord({
-        id: `a_${now}_${Math.random().toString(36).slice(2, 8)}`,
-        question: q,
-        primaryNodeId: primary.nodeId,
-        correct,
-        guessed,
-        durationMs: payload.durationMs,
-        now,
-        selfConfidence: payload.selfConfidence,
-        errorReason: payload.errorReason
-      })
-    )
-    if (this.state.attempts.length > 2000) this.state.attempts.shift()
-
-    // 完成了这张卡上的题，就把卡标记完成
-    const task = this.state.tasks.find(
-      (t) => t.status === 'pending' && t.questionIds.includes(q.id)
-    )
-    if (task && correct) task.status = 'done'
-
+    const result = submitAnswer(this.state, this.questions, payload, now, todayKey(now))
     this.save()
-
-    const after = masteryScore(this.state.mastery[primary.nodeId], now)
-    return {
-      correct,
-      nodeId: primary.nodeId,
-      before,
-      after,
-      beforeBand,
-      afterBand: band(this.state.mastery[primary.nodeId], now),
-      guessed,
-      solution: q.solution,
-      state: this.state
-    }
+    return result
   }
 
   completeTask(taskId: string): { state: AppState; today: Task[] } {
     const t = this.state.tasks.find((x) => x.id === taskId)
     if (t) t.status = 'done'
+    const today = this.today(Date.now(), '完成今日任务后检查路径', t?.stepId)
     this.save()
-    return { state: this.state, today: this.today() }
+    return { state: this.state, today }
   }
 
   postponeTask(taskId: string): { state: AppState; today: Task[] } {
@@ -217,9 +159,7 @@ export class Service {
       s.totalScore = Math.round(patch.totalScore)
     }
     this.save()
-    const key = todayKey(Date.now())
-    this.state.tasks = this.state.tasks.filter((t) => t.date !== key)
-    const today = this.rebuild(Date.now(), key)
+    const today = this.today(Date.now(), '更新今日时间预算')
     return { state: this.state, today, overview: this.overview() }
   }
 

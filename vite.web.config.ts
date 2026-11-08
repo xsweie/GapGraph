@@ -1,6 +1,22 @@
 import { defineConfig } from 'vite'
 import { readFileSync, writeFileSync } from 'node:fs'
-import { resolve } from 'node:path'
+import { join, resolve } from 'node:path'
+
+const runDir = process.env.GAPGRAPH_RUN_DIR
+const aiOrigin = process.env.GAPGRAPH_AI_ORIGIN
+
+function reportWebAddress() {
+  return {
+    name: 'gapgraph-web-address',
+    configureServer(server: import('vite').ViteDevServer) {
+      server.httpServer?.once('listening', () => {
+        const address = server.httpServer?.address()
+        if (!runDir || !address || typeof address === 'string') return
+        writeFileSync(join(runDir, 'web.json'), JSON.stringify({ url: `http://localhost:${address.port}` }))
+      })
+    }
+  }
+}
 
 /**
  * 把构建产物改成"双击就能开"的形态：
@@ -25,8 +41,18 @@ function fileFriendly() {
 export default defineConfig({
   base: './',
   root: resolve('src/renderer'),
-  plugins: [fileFriendly()],
-  server: { port: 5180, open: true, fs: { allow: [resolve('.')] } },
+  plugins: [fileFriendly(), ...(runDir ? [reportWebAddress()] : [])],
+  server: {
+    port: 5180,
+    open: !runDir,
+    fs: {
+      allow: [resolve('.')],
+      deny: ['.env', '.env.*', '*.{crt,pem,key,dpapi}', '.credentials.yaml', '**/.git/**', '**/.data/**']
+    },
+    proxy: runDir && aiOrigin ? {
+      '^/(health|scope|chat|pack|questions|explain)(\\?|$)': aiOrigin
+    } : undefined
+  },
   build: {
     outDir: resolve('out/web'),
     emptyOutDir: true,
